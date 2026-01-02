@@ -47,6 +47,11 @@ vi.mock('fs', async (importOriginal) => {
 
 import { parseAliases, program, ALIASES_FILE, ZSHRC_FILE, ZAM_DIR, BACKUPS_DIR, METADATA_FILE } from '../src/index.js';
 
+// Mock zshrc content that includes both source line and shell wrapper
+const MOCK_ZSHRC = `source ${ALIASES_FILE}
+# Zsh Alias Manager wrapper - auto-sources aliases after changes
+zam() { command zam "$@"; }`;
+
 // Helper to capture console output
 let consoleOutput: string[] = [];
 let consoleErrors: string[] = [];
@@ -180,7 +185,7 @@ describe('CLI Commands', () => {
           return '# Managed by Zsh Alias Manager (zam)\n';
         }
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -201,7 +206,7 @@ describe('CLI Commands', () => {
           return "# Managed by Zsh Alias Manager (zam)\nalias myalias='old command'";
         }
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -224,7 +229,7 @@ describe('CLI Commands', () => {
           return "# Managed by Zsh Alias Manager (zam)\nalias myalias='echo hello'";
         }
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -245,7 +250,7 @@ describe('CLI Commands', () => {
           return '# Managed by Zsh Alias Manager (zam)\n';
         }
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -263,7 +268,7 @@ describe('CLI Commands', () => {
           return "# Managed\nalias foo='bar'\nalias baz='qux'";
         }
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -282,7 +287,7 @@ describe('CLI Commands', () => {
           return '# Managed by Zsh Alias Manager (zam)\n';
         }
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -300,7 +305,7 @@ describe('CLI Commands', () => {
           return "# Managed\nalias gs='git status'\nalias gp='git push'\nalias ll='ls -la'";
         }
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -339,7 +344,7 @@ describe('CLI Commands', () => {
     it('creates a backup file', async () => {
       vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -360,7 +365,7 @@ describe('CLI Commands', () => {
       });
       vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -377,7 +382,7 @@ describe('CLI Commands', () => {
       vi.mocked(fs.existsSync).mockReturnValue(true);
       vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -398,7 +403,7 @@ describe('CLI Commands', () => {
       });
       vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -486,7 +491,7 @@ source ${ALIASES_FILE}`;
           return '# Managed by Zsh Alias Manager (zam)\n';
         }
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -505,7 +510,7 @@ source ${ALIASES_FILE}`;
     it('shows what would be backed up with --dry-run', async () => {
       vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
         if (filePath === ZSHRC_FILE) {
-          return `source ${ALIASES_FILE}`;
+          return MOCK_ZSHRC;
         }
         return '';
       });
@@ -536,7 +541,7 @@ describe('ensureSetup', () => {
     });
     vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       return '';
     });
@@ -578,7 +583,7 @@ describe('ensureSetup', () => {
         return '# Managed by Zsh Alias Manager (zam)\n';
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       return '';
     });
@@ -586,6 +591,29 @@ describe('ensureSetup', () => {
     await runCommand(['list']);
 
     expect(fs.appendFileSync).not.toHaveBeenCalled();
+  });
+
+  it('installs shell wrapper if not present', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) {
+        return '# Managed by Zsh Alias Manager (zam)\n';
+      }
+      if (filePath === ZSHRC_FILE) {
+        // Source line present, but no shell wrapper
+        return `source ${ALIASES_FILE}`;
+      }
+      return '';
+    });
+
+    await runCommand(['list']);
+
+    expect(fs.appendFileSync).toHaveBeenCalledWith(
+      ZSHRC_FILE,
+      expect.stringContaining('# Zsh Alias Manager wrapper'),
+      'utf8'
+    );
+    expect(consoleOutput.join(' ')).toContain('Installed shell wrapper');
   });
 });
 
@@ -608,7 +636,7 @@ describe('rename command', () => {
         return "# Managed\nalias oldname='echo hello'";
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       if (filePath === METADATA_FILE) {
         return '{}';
@@ -637,7 +665,7 @@ describe('rename command', () => {
         return '# Managed by Zsh Alias Manager (zam)\n';
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       if (filePath === METADATA_FILE) {
         return '{}';
@@ -656,7 +684,7 @@ describe('rename command', () => {
         return "# Managed\nalias oldname='echo old'\nalias newname='echo new'";
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       if (filePath === METADATA_FILE) {
         return '{}';
@@ -689,7 +717,7 @@ describe('tags', () => {
         return '# Managed by Zsh Alias Manager (zam)\n';
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       if (filePath === METADATA_FILE) {
         return '{}';
@@ -721,7 +749,7 @@ describe('tags', () => {
         return "# Managed\nalias gs='git status'\nalias gp='git push'\nalias ll='ls -la'";
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       if (filePath === METADATA_FILE) {
         return JSON.stringify({
@@ -746,7 +774,7 @@ describe('tags', () => {
         return "# Managed\nalias foo='bar'";
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       if (filePath === METADATA_FILE) {
         return '{}';
@@ -765,7 +793,7 @@ describe('tags', () => {
         return '# Managed\n';
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       if (filePath === METADATA_FILE) {
         return '{}';
@@ -785,7 +813,7 @@ describe('tags', () => {
         return "# Managed\nalias gs='git status'\nalias ll='ls -la'";
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       if (filePath === METADATA_FILE) {
         return JSON.stringify({
@@ -808,7 +836,7 @@ describe('tags', () => {
         return "# Managed\nalias gs='git status'\nalias ll='ls -la'";
       }
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       if (filePath === METADATA_FILE) {
         // Legacy format with single 'tag' field
@@ -851,7 +879,7 @@ describe('backups command', () => {
     } as fs.Stats);
     vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       return '';
     });
@@ -867,7 +895,7 @@ describe('backups command', () => {
     vi.mocked(fs.readdirSync).mockReturnValue([]);
     vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
       if (filePath === ZSHRC_FILE) {
-        return `source ${ALIASES_FILE}`;
+        return MOCK_ZSHRC;
       }
       return '';
     });

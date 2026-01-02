@@ -22,6 +22,24 @@ export const ZSHRC_FILE = path.join(os.homedir(), '.zshrc');
 
 export const program = new Command();
 
+// Shell wrapper that auto-sources aliases after modifying commands
+const SHELL_WRAPPER_MARKER = '# Zsh Alias Manager wrapper';
+const SHELL_WRAPPER = `
+${SHELL_WRAPPER_MARKER} - auto-sources aliases after changes
+zam() {
+  command zam "$@"
+  local exit_code=$?
+  if [[ $exit_code -eq 0 && -f ~/.zsh_aliases_managed ]]; then
+    case "$1" in
+      add|remove|rename|restore|import|"")
+        source ~/.zsh_aliases_managed
+        ;;
+    esac
+  fi
+  return $exit_code
+}
+`;
+
 // Metadata types
 export interface AliasMetadata {
   tags?: string[];
@@ -151,7 +169,17 @@ function ensureSetup() {
     } else {
       fs.appendFileSync(ZSHRC_FILE, `\n# Added by Zsh Alias Manager (zam)\n[ -f "${ALIASES_FILE}" ] && source "${ALIASES_FILE}"\n`, 'utf8');
       console.log(chalk.green(`Added source instruction to ${ZSHRC_FILE}`));
-      console.log(chalk.blue('Please restart your shell or run "source ~/.zshrc" to apply changes.'));
+    }
+  }
+
+  // Install shell wrapper for auto-sourcing after alias changes
+  if (!zshrcContent.includes(SHELL_WRAPPER_MARKER)) {
+    if (options.dryRun) {
+      console.log(chalk.blue(`[Dry Run] Would install shell wrapper to ${ZSHRC_FILE}`));
+    } else {
+      fs.appendFileSync(ZSHRC_FILE, SHELL_WRAPPER, 'utf8');
+      console.log(chalk.green('Installed shell wrapper - aliases will auto-refresh after changes.'));
+      console.log(chalk.blue('Please restart your shell or run "source ~/.zshrc" to activate.'));
     }
   }
 }
@@ -253,7 +281,6 @@ program
 
         const tagInfo = options.tag?.length ? chalk.dim(` [${options.tag.join(', ')}]`) : '';
         console.log(chalk.green(`Alias '${name}' added successfully!${tagInfo}`));
-        console.log(chalk.dim('Run "source ~/.zshrc" (or open a new terminal) to use it.'));
       }
     } catch (err: any) {
       console.error(chalk.red('Error adding alias:'), err.message);
@@ -276,7 +303,6 @@ program
       if (!getOptions().dryRun) {
         removeAliasMetadata(name);
         console.log(chalk.green(`Alias '${name}' removed successfully!`));
-        console.log(chalk.dim('Run "source ~/.zshrc" (or open a new terminal) to apply.'));
       }
     } catch (err: any) {
       console.error(chalk.red('Error removing alias:'), err.message);
@@ -314,7 +340,6 @@ program
           writeMetadata(metadata);
         }
         console.log(chalk.green(`Alias '${oldName}' renamed to '${newName}'.`));
-        console.log(chalk.dim('Run "source ~/.zshrc" (or open a new terminal) to apply.'));
       }
     } catch (err: any) {
       console.error(chalk.red('Error renaming alias:'), err.message);
@@ -476,7 +501,6 @@ function runRestore(file: string) {
 
       fs.copyFileSync(targetPath, ALIASES_FILE);
       console.log(chalk.green('Aliases restored successfully!'));
-      console.log(chalk.dim('Run "source ~/.zshrc" to apply.'));
     } catch (err: any) {
       console.error(chalk.red('Error restoring backup:'), err.message);
     }
