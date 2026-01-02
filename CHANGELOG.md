@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.2.0...v1.3.0) (2026-01-02)
+
+
+### Features
+
+* add tag editing and tag-based search filtering ([b8c8851](https://github.com/Lander-Parren/zsh-alias-manager/commit/b8c88516efb8e164e60c1818870cb1925069345c))
+
 ## [1.2.0](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.1.1...v1.2.0) (2026-01-02)
 
 
