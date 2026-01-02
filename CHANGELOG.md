@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.1.0...v1.1.1) (2026-01-02)
+
+
+### Bug Fixes
+
+* read version from package.json dynamically ([f99a97c](https://github.com/Lander-Parren/zsh-alias-manager/commit/f99a97c9f92489383c847b9d4abdb2d15de40e17))
+
 ## [1.1.0](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.0.0...v1.1.0) (2026-01-02)
 
 
