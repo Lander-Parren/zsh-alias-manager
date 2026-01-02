@@ -53,3 +53,21 @@ Single-file CLI application (`src/index.ts`) that manages zsh aliases stored in 
 - ES2022 target with NodeNext modules
 - Strict mode enabled
 - ESM package (`"type": "module"`)
+
+## Releasing
+
+Releases are automated via [release-please](https://github.com/googleapis/release-please). Use conventional commits:
+
+```bash
+feat: add new feature     # → minor bump (1.0.0 → 1.1.0)
+fix: fix a bug            # → patch bump (1.0.0 → 1.0.1)
+feat!: breaking change    # → major bump (1.0.0 → 2.0.0)
+chore: update deps        # → no release
+```
+
+**Flow:**
+1. Push commits with conventional prefixes to `main`
+2. Release-please automatically creates/updates a release PR
+3. Merge the PR → GitHub release created + published to npm
+
+The release PR auto-updates `package.json` version and `CHANGELOG.md`.
