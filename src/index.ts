@@ -73,6 +73,17 @@ function formatTags(meta: AliasMetadata | undefined): string {
   return chalk.dim(` [${tags.join(', ')}]`);
 }
 
+// Get all unique tags from metadata
+function getAllTags(metadata: MetadataMap): string[] {
+  const tagSet = new Set<string>();
+  for (const meta of Object.values(metadata)) {
+    for (const tag of getAliasTags(meta)) {
+      tagSet.add(tag);
+    }
+  }
+  return Array.from(tagSet).sort();
+}
+
 // Ensure ~/.zam directory structure exists
 function ensureZamDir() {
   if (!fs.existsSync(ZAM_DIR)) {
@@ -564,6 +575,91 @@ program
   });
 
 
+program
+  .command('tag')
+  .argument('<name>', 'Name of the alias')
+  .option('-s, --set <tags...>', 'Set tags (replaces existing)')
+  .option('-a, --add <tags...>', 'Add tags to existing')
+  .option('-r, --remove <tags...>', 'Remove specific tags')
+  .option('-c, --clear', 'Clear all tags')
+  .description('View or edit tags for an alias')
+  .action((name, options) => {
+    try {
+      const aliases = readAliases();
+      if (!aliases[name]) {
+        console.error(chalk.red(`Alias '${name}' not found.`));
+        return;
+      }
+
+      const metadata = readMetadata();
+      const currentTags = getAliasTags(metadata[name]);
+
+      // If no options provided, just show current tags
+      if (!options.set && !options.add && !options.remove && !options.clear) {
+        if (currentTags.length === 0) {
+          console.log(chalk.yellow(`Alias '${name}' has no tags.`));
+        } else {
+          console.log(chalk.bold(`Tags for '${name}':`), currentTags.join(', '));
+        }
+        return;
+      }
+
+      if (getOptions().dryRun) {
+        if (options.clear) {
+          console.log(chalk.blue(`[Dry Run] Would clear tags for '${name}'`));
+        } else if (options.set) {
+          console.log(chalk.blue(`[Dry Run] Would set tags for '${name}' to: ${options.set.join(', ')}`));
+        } else if (options.add) {
+          console.log(chalk.blue(`[Dry Run] Would add tags to '${name}': ${options.add.join(', ')}`));
+        } else if (options.remove) {
+          console.log(chalk.blue(`[Dry Run] Would remove tags from '${name}': ${options.remove.join(', ')}`));
+        }
+        return;
+      }
+
+      let newTags: string[] = [...currentTags];
+
+      if (options.clear) {
+        newTags = [];
+      } else if (options.set) {
+        newTags = options.set;
+      } else if (options.add) {
+        // Add tags that don't already exist (case-insensitive check)
+        for (const tag of options.add) {
+          if (!newTags.some(t => t.toLowerCase() === tag.toLowerCase())) {
+            newTags.push(tag);
+          }
+        }
+      } else if (options.remove) {
+        // Remove specified tags (case-insensitive)
+        const tagsToRemove = options.remove.map((t: string) => t.toLowerCase());
+        newTags = newTags.filter(t => !tagsToRemove.includes(t.toLowerCase()));
+      }
+
+      // Update metadata
+      if (newTags.length === 0) {
+        // Remove tags field entirely if empty
+        const meta = metadata[name] || {};
+        delete meta.tags;
+        delete meta.tag; // Remove legacy field too
+        metadata[name] = meta;
+      } else {
+        metadata[name] = { ...metadata[name], tags: newTags };
+        // Remove legacy tag field if present
+        delete metadata[name].tag;
+      }
+      writeMetadata(metadata);
+
+      if (newTags.length === 0) {
+        console.log(chalk.green(`Tags cleared for '${name}'.`));
+      } else {
+        console.log(chalk.green(`Tags updated for '${name}':`), newTags.join(', '));
+      }
+    } catch (err: any) {
+      console.error(chalk.red('Error updating tags:'), err.message);
+    }
+  });
+
 function runImport() {
     try {
       const options = getOptions();
@@ -687,6 +783,7 @@ program
               { name: 'Search/Filter', value: 'Search/Filter' },
               { name: 'Add New', value: 'Add New' },
               { name: 'Edit Alias', value: 'Edit Alias' },
+              { name: 'Edit Tags', value: 'Edit Tags' },
               { name: 'Delete Alias', value: 'Delete Alias' },
               { name: 'Rename Alias', value: 'Rename Alias' },
               { name: 'List All', value: 'List All' },
@@ -788,6 +885,90 @@ program
             }
           }
         }
+        else if (action === 'Edit Tags') {
+          // Use search for fuzzy selection
+          const selected = await search({
+            message: 'Search and select alias to edit tags:',
+            source: async (term) => {
+              const filtered = names.filter(n =>
+                !term || n.toLowerCase().includes(term.toLowerCase()) ||
+                aliases[n].toLowerCase().includes(term.toLowerCase())
+              );
+              return filtered.map(n => ({
+                name: `${n}${formatTags(metadata[n])} = ${aliases[n]}`,
+                value: n
+              }));
+            }
+          });
+
+          if (selected) {
+            const currentTags = getAliasTags(metadata[selected]);
+            console.log(chalk.dim(`Current tags: ${currentTags.length > 0 ? currentTags.join(', ') : '(none)'}`));
+
+            const tagAction = await select({
+              message: 'What would you like to do?',
+              choices: [
+                { name: 'Set tags (replace all)', value: 'set' },
+                { name: 'Add tags', value: 'add' },
+                ...(currentTags.length > 0 ? [{ name: 'Remove tags', value: 'remove' }] : []),
+                ...(currentTags.length > 0 ? [{ name: 'Clear all tags', value: 'clear' }] : []),
+                { name: 'Cancel', value: 'cancel' }
+              ]
+            });
+
+            if (tagAction === 'cancel') {
+              continue;
+            }
+
+            if (tagAction === 'clear') {
+              const meta = metadata[selected] || {};
+              delete meta.tags;
+              delete meta.tag;
+              metadata[selected] = meta;
+              writeMetadata(metadata);
+              console.log(chalk.green(`Tags cleared for '${selected}'.`));
+            } else if (tagAction === 'set' || tagAction === 'add') {
+              const tagsInput = await input({
+                message: tagAction === 'set' ? 'Enter tags (comma-separated):' : 'Enter tags to add (comma-separated):'
+              });
+              if (tagsInput) {
+                const inputTags = tagsInput.split(',').map(t => t.trim()).filter(Boolean);
+                let newTags: string[];
+                if (tagAction === 'set') {
+                  newTags = inputTags;
+                } else {
+                  newTags = [...currentTags];
+                  for (const tag of inputTags) {
+                    if (!newTags.some(t => t.toLowerCase() === tag.toLowerCase())) {
+                      newTags.push(tag);
+                    }
+                  }
+                }
+                metadata[selected] = { ...metadata[selected], tags: newTags };
+                delete metadata[selected].tag;
+                writeMetadata(metadata);
+                console.log(chalk.green(`Tags updated for '${selected}':`), newTags.join(', '));
+              }
+            } else if (tagAction === 'remove') {
+              const tagToRemove = await select({
+                message: 'Select tag to remove:',
+                choices: currentTags.map(t => ({ name: t, value: t }))
+              });
+              const newTags = currentTags.filter(t => t !== tagToRemove);
+              if (newTags.length === 0) {
+                const meta = metadata[selected] || {};
+                delete meta.tags;
+                delete meta.tag;
+                metadata[selected] = meta;
+              } else {
+                metadata[selected] = { ...metadata[selected], tags: newTags };
+                delete metadata[selected].tag;
+              }
+              writeMetadata(metadata);
+              console.log(chalk.green(`Tag '${tagToRemove}' removed from '${selected}'.`));
+            }
+          }
+        }
         else if (action === 'Delete Alias') {
           // Use search for fuzzy selection
           const selected = await search({
@@ -854,19 +1035,51 @@ program
           }
         }
         else if (action === 'Search/Filter') {
-          const query = await input({ message: 'Search:' });
+          // Get all available tags
+          const allTags = getAllTags(metadata);
+          let tagFilter: string | null = null;
 
-          const matches = names.filter(n =>
-            n.toLowerCase().includes(query.toLowerCase()) ||
-            aliases[n].toLowerCase().includes(query.toLowerCase())
-          );
+          // Offer tag filter if tags exist
+          if (allTags.length > 0) {
+            const tagChoice = await select({
+              message: 'Filter by tag?',
+              choices: [
+                { name: 'All tags', value: '__all__' },
+                ...allTags.map(t => ({ name: t, value: t }))
+              ]
+            });
+            if (tagChoice !== '__all__') {
+              tagFilter = tagChoice;
+            }
+          }
+
+          const query = await input({ message: 'Search (leave empty to list all):' });
+
+          let matches = names;
+
+          // Apply tag filter first
+          if (tagFilter) {
+            matches = matches.filter(n => aliasHasTag(metadata[n], tagFilter!));
+          }
+
+          // Apply text search if query provided
+          if (query) {
+            matches = matches.filter(n =>
+              n.toLowerCase().includes(query.toLowerCase()) ||
+              aliases[n].toLowerCase().includes(query.toLowerCase())
+            );
+          }
 
           if (matches.length === 0) {
-            console.log(chalk.yellow('No matches found.'));
+            const filterInfo = tagFilter ? ` with tag '${tagFilter}'` : '';
+            console.log(chalk.yellow(`No matches found${filterInfo}.`));
           } else {
-            console.log(chalk.bold(`Found ${matches.length} matches:`));
+            const filterInfo = tagFilter ? ` (tag: ${tagFilter})` : '';
+            console.log(chalk.bold(`Found ${matches.length} matches${filterInfo}:`));
             matches.forEach(m => {
-              console.log(`  ${highlightMatch(m, query)}${formatTags(metadata[m])} = ${highlightMatch(aliases[m], query)}`);
+              const displayName = query ? highlightMatch(m, query) : chalk.cyan(m);
+              const displayCmd = query ? highlightMatch(aliases[m], query) : chalk.white(aliases[m]);
+              console.log(`  ${displayName}${formatTags(metadata[m])} = ${displayCmd}`);
             });
           }
         }
