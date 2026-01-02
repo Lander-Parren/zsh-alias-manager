@@ -6,6 +6,12 @@ import path from 'path';
 import os from 'os';
 import { spawn } from 'child_process';
 import { select, input, confirm as askConfirm, search } from '@inquirer/prompts';
+import { fileURLToPath } from 'url';
+
+// Read version from package.json
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+const VERSION = packageJson.version;
 
 // Directory structure
 export const ZAM_DIR = path.join(os.homedir(), '.zam');
@@ -109,7 +115,7 @@ function highlightMatch(text: string, query: string): string {
 program
   .name('zam')
   .description('Zsh Alias Manager - Easily manage your zsh aliases')
-  .version('1.0.0')
+  .version(VERSION)
   .option('-d, --dry-run', 'Simulate actions without writing to files');
 
 function getOptions() {

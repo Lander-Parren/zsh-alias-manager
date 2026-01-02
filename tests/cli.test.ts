@@ -1,11 +1,51 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { parseAliases, program, ALIASES_FILE, ZSHRC_FILE, ZAM_DIR, BACKUPS_DIR, METADATA_FILE } from '../src/index.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
-// Mock fs module to prevent actual file operations
-vi.mock('fs');
+// Mock fs module - need to handle package.json read at module load time
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      readFileSync: vi.fn((filePath: string, encoding?: string) => {
+        // Return actual package.json for version reading
+        if (typeof filePath === 'string' && filePath.includes('package.json')) {
+          return actual.readFileSync(filePath, encoding as BufferEncoding);
+        }
+        return '';
+      }),
+      existsSync: vi.fn(() => true),
+      writeFileSync: vi.fn(),
+      mkdirSync: vi.fn(),
+      copyFileSync: vi.fn(),
+      readdirSync: vi.fn(() => []),
+      statSync: vi.fn(() => ({ mtime: new Date() })),
+      appendFileSync: vi.fn(),
+      unlinkSync: vi.fn(),
+      realpathSync: vi.fn((p: string) => p),
+    },
+    readFileSync: vi.fn((filePath: string, encoding?: string) => {
+      if (typeof filePath === 'string' && filePath.includes('package.json')) {
+        return actual.readFileSync(filePath, encoding as BufferEncoding);
+      }
+      return '';
+    }),
+    existsSync: vi.fn(() => true),
+    writeFileSync: vi.fn(),
+    mkdirSync: vi.fn(),
+    copyFileSync: vi.fn(),
+    readdirSync: vi.fn(() => []),
+    statSync: vi.fn(() => ({ mtime: new Date() })),
+    appendFileSync: vi.fn(),
+    unlinkSync: vi.fn(),
+    realpathSync: vi.fn((p: string) => p),
+  };
+});
+
+import { parseAliases, program, ALIASES_FILE, ZSHRC_FILE, ZAM_DIR, BACKUPS_DIR, METADATA_FILE } from '../src/index.js';
 
 // Helper to capture console output
 let consoleOutput: string[] = [];
