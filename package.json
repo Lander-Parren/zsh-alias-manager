@@ -1,0 +1,48 @@
+{
+  "name": "zsh-alias-manager",
+  "version": "1.0.0",
+  "description": "A CLI tool to manage zsh aliases with tags, search, and interactive mode",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "zam": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["zsh", "alias", "shell", "cli", "terminal", "bash", "macos"],
+  "author": "Lander Parren",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Lander-Parren/zsh-alias-manager.git"
+  },
+  "homepage": "https://github.com/Lander-Parren/zsh-alias-manager#readme",
+  "bugs": {
+    "url": "https://github.com/Lander-Parren/zsh-alias-manager/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "dist"
+  ],
+  "packageManager": "pnpm@10.17.1",
+  "dependencies": {
+    "@inquirer/prompts": "^8.1.0",
+    "chalk": "^5.6.2",
+    "commander": "^14.0.2"
+  },
+  "devDependencies": {
+    "@types/inquirer": "^9.0.9",
+    "@types/node": "^25.0.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
+  }
+}
