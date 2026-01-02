@@ -1,8 +1,6 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
-
-## [1.0.0] - 2025-01-02
+## [1.0.0](https://github.com/Lander-Parren/zsh-alias-manager/releases/tag/v1.0.0) (2025-01-02)
 
 ### Added
 - **Interactive mode** - Fuzzy search and menu-driven interface for managing aliases
