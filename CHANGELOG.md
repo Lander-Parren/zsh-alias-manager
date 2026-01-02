@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.1.1...v1.2.0) (2026-01-02)
+
+
+### Features
+
+* auto-refresh shell after alias changes ([0108937](https://github.com/Lander-Parren/zsh-alias-manager/commit/01089373399eb1c2c256c300a58d7ae68b2e6d03))
+
 ## [1.1.1](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.1.0...v1.1.1) (2026-01-02)
 
 
