@@ -662,10 +662,15 @@ describe('tags', () => {
     expect(consoleOutput.join(' ')).toContain('added successfully');
     expect(consoleOutput.join(' ')).toContain('[git]');
 
-    // Should write metadata with tag
+    // Should write metadata with tags array
     expect(fs.writeFileSync).toHaveBeenCalledWith(
       METADATA_FILE,
-      expect.stringContaining('"tag": "git"'),
+      expect.stringContaining('"tags"'),
+      'utf8'
+    );
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      METADATA_FILE,
+      expect.stringContaining('"git"'),
       'utf8'
     );
   });
@@ -712,6 +717,73 @@ describe('tags', () => {
     await runCommand(['list', '--tag', 'nonexistent']);
 
     expect(consoleOutput.join(' ')).toContain('No aliases found with tag');
+  });
+
+  it('adds alias with multiple tags', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) {
+        return '# Managed\n';
+      }
+      if (filePath === ZSHRC_FILE) {
+        return `source ${ALIASES_FILE}`;
+      }
+      if (filePath === METADATA_FILE) {
+        return '{}';
+      }
+      return '';
+    });
+
+    await runCommand(['add', 'gs', 'git status', '--tag', 'git', '--tag', 'common']);
+
+    expect(consoleOutput.join(' ')).toContain('added successfully');
+    expect(consoleOutput.join(' ')).toContain('[git, common]');
+  });
+
+  it('filters by tag when alias has multiple tags', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) {
+        return "# Managed\nalias gs='git status'\nalias ll='ls -la'";
+      }
+      if (filePath === ZSHRC_FILE) {
+        return `source ${ALIASES_FILE}`;
+      }
+      if (filePath === METADATA_FILE) {
+        return JSON.stringify({
+          gs: { tags: ['git', 'common'] },
+          ll: { tags: ['shell'] }
+        });
+      }
+      return '';
+    });
+
+    await runCommand(['list', '--tag', 'common']);
+
+    expect(consoleOutput.join(' ')).toContain('gs');
+    expect(consoleOutput.join(' ')).not.toContain('ll');
+  });
+
+  it('handles legacy single tag format', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) {
+        return "# Managed\nalias gs='git status'\nalias ll='ls -la'";
+      }
+      if (filePath === ZSHRC_FILE) {
+        return `source ${ALIASES_FILE}`;
+      }
+      if (filePath === METADATA_FILE) {
+        // Legacy format with single 'tag' field
+        return JSON.stringify({
+          gs: { tag: 'git' },
+          ll: { tag: 'shell' }
+        });
+      }
+      return '';
+    });
+
+    await runCommand(['list', '--tag', 'git']);
+
+    expect(consoleOutput.join(' ')).toContain('gs');
+    expect(consoleOutput.join(' ')).not.toContain('ll');
   });
 });
 

@@ -18,12 +18,35 @@ export const program = new Command();
 
 // Metadata types
 export interface AliasMetadata {
-  tag?: string;
+  tags?: string[];
   created?: string;
+  // Legacy field for backwards compatibility
+  tag?: string;
 }
 
 export interface MetadataMap {
   [aliasName: string]: AliasMetadata;
+}
+
+// Normalize tags from metadata (handles legacy single tag)
+function getAliasTags(meta: AliasMetadata | undefined): string[] {
+  if (!meta) return [];
+  if (meta.tags && meta.tags.length > 0) return meta.tags;
+  if (meta.tag) return [meta.tag];
+  return [];
+}
+
+// Check if alias has a specific tag (case-insensitive)
+function aliasHasTag(meta: AliasMetadata | undefined, tag: string): boolean {
+  const tags = getAliasTags(meta);
+  return tags.some(t => t.toLowerCase() === tag.toLowerCase());
+}
+
+// Format tags for display
+function formatTags(meta: AliasMetadata | undefined): string {
+  const tags = getAliasTags(meta);
+  if (tags.length === 0) return '';
+  return chalk.dim(` [${tags.join(', ')}]`);
 }
 
 // Ensure ~/.zam directory structure exists
@@ -70,11 +93,6 @@ function removeAliasMetadata(aliasName: string) {
   writeMetadata(metadata);
 }
 
-// Get tag for an alias
-function getAliasTag(aliasName: string): string | undefined {
-  const metadata = readMetadata();
-  return metadata[aliasName]?.tag;
-}
 
 // Highlight matching text in search results
 function highlightMatch(text: string, query: string): string {
@@ -208,7 +226,7 @@ program
   .command('add')
   .argument('<name>', 'Name of the alias')
   .argument('<command>', 'Command to run')
-  .option('-t, --tag <tag>', 'Tag/category for the alias (e.g., git, docker)')
+  .option('-t, --tag <tag...>', 'Tag(s) for the alias (can be used multiple times)')
   .description('Add a new alias')
   .action((name, command, options) => {
     try {
@@ -219,15 +237,15 @@ program
       aliases[name] = command;
       writeAliases(aliases);
 
-      // Save metadata (tag and created date)
+      // Save metadata (tags and created date)
       if (!getOptions().dryRun) {
         const metaData: AliasMetadata = { created: new Date().toISOString() };
-        if (options.tag) {
-          metaData.tag = options.tag;
+        if (options.tag && options.tag.length > 0) {
+          metaData.tags = options.tag;
         }
         setAliasMetadata(name, metaData);
 
-        const tagInfo = options.tag ? chalk.dim(` [${options.tag}]`) : '';
+        const tagInfo = options.tag?.length ? chalk.dim(` [${options.tag.join(', ')}]`) : '';
         console.log(chalk.green(`Alias '${name}' added successfully!${tagInfo}`));
         console.log(chalk.dim('Run "source ~/.zshrc" (or open a new terminal) to use it.'));
       }
@@ -309,9 +327,7 @@ program
 
       // Filter by tag if specified
       if (options.tag) {
-        entries = entries.filter(([name]) =>
-          metadata[name]?.tag?.toLowerCase() === options.tag.toLowerCase()
-        );
+        entries = entries.filter(([name]) => aliasHasTag(metadata[name], options.tag));
       }
 
       if (entries.length === 0) {
@@ -326,9 +342,7 @@ program
       const tagInfo = options.tag ? ` (tag: ${options.tag})` : '';
       console.log(chalk.bold(`Managed Aliases${tagInfo}:`));
       for (const [name, cmd] of entries) {
-        const tag = metadata[name]?.tag;
-        const tagDisplay = tag ? chalk.dim(` [${tag}]`) : '';
-        console.log(`  ${chalk.cyan(name)}${tagDisplay} = ${chalk.white(cmd)}`);
+        console.log(`  ${chalk.cyan(name)}${formatTags(metadata[name])} = ${chalk.white(cmd)}`);
       }
     } catch (err: any) {
       console.error(chalk.red('Error listing aliases:'), err.message);
@@ -344,17 +358,17 @@ program
     try {
       const aliases = readAliases();
       const metadata = readMetadata();
-      const results: { name: string, cmd: string, tag?: string }[] = [];
+      const results: { name: string, cmd: string, meta?: AliasMetadata }[] = [];
       const lowerQuery = query.toLowerCase();
 
       for (const [name, cmd] of Object.entries(aliases)) {
         // Filter by tag first if specified
-        if (options.tag && metadata[name]?.tag?.toLowerCase() !== options.tag.toLowerCase()) {
+        if (options.tag && !aliasHasTag(metadata[name], options.tag)) {
           continue;
         }
 
         if (name.toLowerCase().includes(lowerQuery) || cmd.toLowerCase().includes(lowerQuery)) {
-          results.push({ name, cmd, tag: metadata[name]?.tag });
+          results.push({ name, cmd, meta: metadata[name] });
         }
       }
 
@@ -365,10 +379,9 @@ program
 
       console.log(chalk.bold(`Found ${results.length} matches:`));
       for (const res of results) {
-        const tagDisplay = res.tag ? chalk.dim(` [${res.tag}]`) : '';
         const highlightedName = highlightMatch(res.name, query);
         const highlightedCmd = highlightMatch(res.cmd, query);
-        console.log(`  ${chalk.cyan(highlightedName)}${tagDisplay} = ${chalk.white(highlightedCmd)}`);
+        console.log(`  ${chalk.cyan(highlightedName)}${formatTags(res.meta)} = ${chalk.white(highlightedCmd)}`);
       }
     } catch (err: any) {
       console.error(chalk.red('Error searching aliases:'), err.message);
@@ -703,13 +716,14 @@ program
           const command = await input({ message: 'Command:' });
           if (!command) continue;
 
-          const tag = await input({ message: 'Tag (optional, e.g., git, docker):' });
+          const tagsInput = await input({ message: 'Tags (optional, comma-separated, e.g., git,common):' });
+          const tags = tagsInput ? tagsInput.split(',').map(t => t.trim()).filter(Boolean) : [];
 
           aliases[name] = command;
           writeAliases(aliases);
 
           const metaData: AliasMetadata = { created: new Date().toISOString() };
-          if (tag) metaData.tag = tag;
+          if (tags.length > 0) metaData.tags = tags;
           setAliasMetadata(name, metaData);
 
           console.log(chalk.green(`Alias '${name}' added.`));
@@ -822,9 +836,7 @@ program
           } else {
             console.log(chalk.bold(`Found ${matches.length} matches:`));
             matches.forEach(m => {
-              const tag = metadata[m]?.tag;
-              const tagDisplay = tag ? chalk.dim(` [${tag}]`) : '';
-              console.log(`  ${highlightMatch(m, query)}${tagDisplay} = ${highlightMatch(aliases[m], query)}`);
+              console.log(`  ${highlightMatch(m, query)}${formatTags(metadata[m])} = ${highlightMatch(aliases[m], query)}`);
             });
           }
         }
@@ -834,9 +846,7 @@ program
           } else {
             console.log(chalk.bold('All Aliases:'));
             for (const name of names) {
-              const tag = metadata[name]?.tag;
-              const tagDisplay = tag ? chalk.dim(` [${tag}]`) : '';
-              console.log(`  ${chalk.cyan(name)}${tagDisplay} = ${chalk.white(aliases[name])}`);
+              console.log(`  ${chalk.cyan(name)}${formatTags(metadata[name])} = ${chalk.white(aliases[name])}`);
             }
           }
         }
