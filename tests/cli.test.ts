@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { spawnSync as actualSpawnSync } from 'child_process';
 
 // Mock fs module - need to handle package.json read at module load time
 vi.mock('fs', async (importOriginal) => {
@@ -45,7 +46,15 @@ vi.mock('fs', async (importOriginal) => {
   };
 });
 
-import { parseAliases, program, ALIASES_FILE, ZSHRC_FILE, ZAM_DIR, BACKUPS_DIR, METADATA_FILE } from '../src/index.js';
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  return {
+    ...actual,
+    spawnSync: vi.fn(() => ({ status: 0, stdout: '', stderr: '' })),
+  };
+});
+
+import { parseAliases, program, ALIASES_FILE, ZSHRC_FILE, ZAM_DIR, BACKUPS_DIR, METADATA_FILE, CONFIG_FILE } from '../src/index.js';
 
 // Mock zshrc content that includes both source line and shell wrapper
 const MOCK_ZSHRC = `source ${ALIASES_FILE}
@@ -903,5 +912,482 @@ describe('backups command', () => {
     await runCommand(['backups']);
 
     expect(consoleOutput.join(' ')).toContain('No backups found');
+  });
+});
+
+describe('doctor command', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockConsole();
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+    vi.mocked(fs.mkdirSync).mockImplementation(() => undefined);
+    vi.mocked(fs.realpathSync).mockImplementation(() => { throw new Error('mock'); });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const healthyReadFileSync = (filePath: string) => {
+    if (filePath === ALIASES_FILE) {
+      return "# Managed\nalias gs='git status'";
+    }
+    if (filePath === ZSHRC_FILE) {
+      return `source ${ALIASES_FILE}\n# Zsh Alias Manager wrapper - auto-sources aliases after changes\nzam() { command zam "$@"; }`;
+    }
+    if (filePath === METADATA_FILE) {
+      return JSON.stringify({ gs: { tags: ['git'] } });
+    }
+    return '';
+  };
+
+  it('passes all checks in healthy state', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation(healthyReadFileSync);
+
+    await runCommand(['doctor']);
+
+    const output = consoleOutput.join('\n');
+    expect(output).toContain('✅ Aliases file exists');
+    expect(output).toContain('✅ Source line found in .zshrc');
+    expect(output).toContain('✅ Shell wrapper installed');
+    expect(output).toContain('✅ No orphaned metadata entries');
+    expect(output).toContain('✅ No conflicting aliases in .zshrc');
+    expect(output).toContain('✅ Backup directory exists');
+    expect(output).toContain('✅ Metadata file is valid JSON');
+    expect(output).toContain('All checks passed.');
+  });
+
+  it('reports ERROR when aliases file missing', async () => {
+    vi.mocked(fs.existsSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) return false;
+      return true;
+    });
+    vi.mocked(fs.readFileSync).mockImplementation(healthyReadFileSync);
+
+    await runCommand(['doctor']);
+
+    const output = consoleOutput.join('\n');
+    expect(output).toContain('❌ Aliases file not found');
+    expect(output).toContain('Found');
+    expect(output).toContain('issue(s)');
+  });
+
+  it('reports ERROR when source line missing from .zshrc', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) {
+        return "# Managed\nalias gs='git status'";
+      }
+      if (filePath === ZSHRC_FILE) {
+        return 'export PATH=/usr/bin';
+      }
+      if (filePath === METADATA_FILE) {
+        return JSON.stringify({ gs: { tags: ['git'] } });
+      }
+      return '';
+    });
+
+    await runCommand(['doctor']);
+
+    const output = consoleOutput.join('\n');
+    expect(output).toContain('⚠️');
+    expect(output).toContain('Source line not found in .zshrc');
+  });
+
+  it('reports WARNING when shell wrapper not installed', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) {
+        return "# Managed\nalias gs='git status'";
+      }
+      if (filePath === ZSHRC_FILE) {
+        return `source ${ALIASES_FILE}`;
+      }
+      if (filePath === METADATA_FILE) {
+        return JSON.stringify({ gs: { tags: ['git'] } });
+      }
+      return '';
+    });
+
+    await runCommand(['doctor']);
+
+    const output = consoleOutput.join('\n');
+    expect(output).toContain('⚠️');
+    expect(output).toContain('Shell wrapper not installed');
+  });
+
+  it('reports WARNING for orphaned metadata entries', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) {
+        return '# Managed\n';
+      }
+      if (filePath === ZSHRC_FILE) {
+        return `source ${ALIASES_FILE}\n# Zsh Alias Manager wrapper - auto-sources aliases after changes\nzam() { command zam "$@"; }`;
+      }
+      if (filePath === METADATA_FILE) {
+        return JSON.stringify({ ghost: { tags: ['old'] } });
+      }
+      return '';
+    });
+
+    await runCommand(['doctor']);
+
+    const output = consoleOutput.join('\n');
+    expect(output).toContain('⚠️');
+    expect(output).toContain("Orphaned metadata for 'ghost'");
+  });
+
+  it('reports WARNING for conflicting aliases in .zshrc', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) {
+        return "# Managed\nalias gs='git status'";
+      }
+      if (filePath === ZSHRC_FILE) {
+        return `source ${ALIASES_FILE}\n# Zsh Alias Manager wrapper\nalias gs='git stash'`;
+      }
+      if (filePath === METADATA_FILE) {
+        return JSON.stringify({ gs: { tags: ['git'] } });
+      }
+      return '';
+    });
+
+    await runCommand(['doctor']);
+
+    const output = consoleOutput.join('\n');
+    expect(output).toContain('⚠️');
+    expect(output).toContain("Conflicting alias 'gs' in .zshrc");
+  });
+
+  it('reports ERROR for invalid metadata JSON', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) {
+        return "# Managed\nalias gs='git status'";
+      }
+      if (filePath === ZSHRC_FILE) {
+        return `source ${ALIASES_FILE}\n# Zsh Alias Manager wrapper - auto-sources aliases after changes\nzam() { command zam "$@"; }`;
+      }
+      if (filePath === METADATA_FILE) {
+        return '{ invalid json }}}';
+      }
+      return '';
+    });
+
+    await runCommand(['doctor']);
+
+    const output = consoleOutput.join('\n');
+    expect(output).toContain('❌');
+    expect(output).toContain('Metadata file contains invalid JSON');
+  });
+
+  it('counts issues correctly in summary', async () => {
+    vi.mocked(fs.existsSync).mockImplementation((filePath) => {
+      if (filePath === ALIASES_FILE) return false;
+      if (filePath === BACKUPS_DIR) return false;
+      return true;
+    });
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ZSHRC_FILE) return 'export PATH=/usr/bin';
+      if (filePath === METADATA_FILE) return '{ invalid }}}';
+      return '';
+    });
+
+    await runCommand(['doctor']);
+
+    const output = consoleOutput.join('\n');
+    expect(output).toContain('Found');
+    expect(output).toContain('issue(s)');
+  });
+
+  it('supports --dry-run mode', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation(healthyReadFileSync);
+
+    await runCommand(['--dry-run', 'doctor']);
+
+    const output = consoleOutput.join('\n');
+    expect(output).toContain('[Dry Run]');
+    expect(output).toContain('Would run 7 health checks');
+  });
+});
+
+describe('sync commands', () => {
+  let spawnSyncMock: ReturnType<typeof vi.fn>;
+
+  const SYNC_REPO = '/mock/sync-repo';
+  const SYNC_FILE = path.join(SYNC_REPO, 'aliases.json');
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockConsole();
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+    vi.mocked(fs.mkdirSync).mockImplementation(() => undefined);
+    vi.mocked(fs.realpathSync).mockImplementation(() => { throw new Error('mock'); });
+    spawnSyncMock = vi.mocked(actualSpawnSync);
+    spawnSyncMock.mockReturnValue({ status: 0, stdout: '', stderr: '' } as any);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  describe('sync init', () => {
+    it('stores config for valid git repo', async () => {
+      vi.mocked(fs.existsSync).mockImplementation((filePath) => {
+        if (filePath === ALIASES_FILE) return true;
+        if (filePath === path.resolve(SYNC_REPO, '.git')) return true;
+        return true;
+      });
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        return '';
+      });
+
+      await runCommand(['sync', 'init', SYNC_REPO]);
+
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        CONFIG_FILE,
+        expect.stringContaining(`"syncRepo": "${SYNC_REPO}"`),
+        'utf8'
+      );
+      expect(consoleOutput.join(' ')).toContain('Sync configured');
+    });
+
+    it('errors on non-git directory', async () => {
+      vi.mocked(fs.existsSync).mockImplementation((filePath) => {
+        if (filePath === path.resolve('/some/dir', '.git')) return false;
+        return true;
+      });
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        return '';
+      });
+
+      await runCommand(['sync', 'init', '/some/dir']);
+
+      expect(consoleErrors.join(' ')).toContain('Not a git repository');
+    });
+
+    it('errors on missing directory', async () => {
+      vi.mocked(fs.existsSync).mockImplementation((filePath) => {
+        if (filePath === path.resolve('/no/such/dir')) return false;
+        return true;
+      });
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        return '';
+      });
+
+      await runCommand(['sync', 'init', '/no/such/dir']);
+
+      expect(consoleErrors.join(' ')).toContain('Directory not found');
+    });
+  });
+
+  describe('sync push', () => {
+    it('writes aliases.json and runs git commands', async () => {
+      vi.mocked(fs.existsSync).mockImplementation((filePath) => {
+        if (filePath === CONFIG_FILE) return true;
+        if (filePath === SYNC_FILE) return true;
+        return true;
+      });
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        if (filePath === ALIASES_FILE) return "# Managed\nalias gs='git status'";
+        if (filePath === METADATA_FILE) return JSON.stringify({ gs: { tags: ['sync'], created: '2024-01-01T00:00:00.000Z' } });
+        if (filePath === CONFIG_FILE) return JSON.stringify({ syncRepo: SYNC_REPO, syncTag: 'sync' });
+        return '';
+      });
+
+      await runCommand(['sync', 'push']);
+
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        SYNC_FILE,
+        expect.stringContaining('"name": "gs"'),
+        'utf8'
+      );
+      expect(spawnSyncMock).toHaveBeenCalledWith('git', ['add', 'aliases.json'], expect.objectContaining({ cwd: SYNC_REPO }));
+      expect(spawnSyncMock).toHaveBeenCalledWith('git', ['commit', '-m', 'zam sync: update aliases'], expect.objectContaining({ cwd: SYNC_REPO }));
+      expect(spawnSyncMock).toHaveBeenCalledWith('git', ['push'], expect.objectContaining({ cwd: SYNC_REPO }));
+      expect(consoleOutput.join(' ')).toContain('Pushed 1 aliases');
+    });
+
+    it('errors when sync not configured', async () => {
+      vi.mocked(fs.existsSync).mockImplementation((filePath) => {
+        if (filePath === CONFIG_FILE) return false;
+        return true;
+      });
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        if (filePath === ALIASES_FILE) return '# Managed\n';
+        if (filePath === METADATA_FILE) return '{}';
+        if (filePath === CONFIG_FILE) return '{}';
+        return '';
+      });
+
+      await runCommand(['sync', 'push']);
+
+      expect(consoleErrors.join(' ')).toContain('Sync not configured');
+    });
+
+    it('handles no tagged aliases', async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        if (filePath === ALIASES_FILE) return "# Managed\nalias gs='git status'";
+        if (filePath === METADATA_FILE) return JSON.stringify({ gs: { tags: ['git'] } });
+        if (filePath === CONFIG_FILE) return JSON.stringify({ syncRepo: SYNC_REPO, syncTag: 'sync' });
+        return '';
+      });
+
+      await runCommand(['sync', 'push']);
+
+      expect(consoleOutput.join(' ')).toContain('No aliases tagged');
+    });
+  });
+
+  describe('sync pull', () => {
+    it('imports new aliases', async () => {
+      const remoteData = {
+        version: 1,
+        exportedAt: '2024-01-01T00:00:00.000Z',
+        aliases: [
+          { name: 'gp', command: 'git push', tags: ['sync'], created: '2024-01-01T00:00:00.000Z' },
+        ],
+      };
+
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        if (filePath === ALIASES_FILE) return '# Managed\n';
+        if (filePath === METADATA_FILE) return '{}';
+        if (filePath === CONFIG_FILE) return JSON.stringify({ syncRepo: SYNC_REPO, syncTag: 'sync' });
+        if (filePath === SYNC_FILE) return JSON.stringify(remoteData);
+        return '';
+      });
+
+      await runCommand(['sync', 'pull']);
+
+      expect(fs.writeFileSync).toHaveBeenCalledWith(
+        ALIASES_FILE,
+        expect.stringContaining("alias gp='git push'"),
+        'utf8'
+      );
+      expect(consoleOutput.join(' ')).toContain('Imported 1 new');
+    });
+
+    it('errors when sync not configured', async () => {
+      vi.mocked(fs.existsSync).mockImplementation((filePath) => {
+        if (filePath === CONFIG_FILE) return false;
+        return true;
+      });
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        if (filePath === ALIASES_FILE) return '# Managed\n';
+        if (filePath === METADATA_FILE) return '{}';
+        if (filePath === CONFIG_FILE) return '{}';
+        return '';
+      });
+
+      await runCommand(['sync', 'pull']);
+
+      expect(consoleErrors.join(' ')).toContain('Sync not configured');
+    });
+  });
+
+  describe('sync status', () => {
+    it('shows diff between local and remote', async () => {
+      const remoteData = {
+        version: 1,
+        exportedAt: '2024-01-01T00:00:00.000Z',
+        aliases: [
+          { name: 'gp', command: 'git push', tags: ['sync'] },
+          { name: 'gs', command: 'git status', tags: ['sync'] },
+        ],
+      };
+
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        if (filePath === ALIASES_FILE) return "# Managed\nalias gs='git status'\nalias gl='git log'";
+        if (filePath === METADATA_FILE) return JSON.stringify({
+          gs: { tags: ['sync'] },
+          gl: { tags: ['sync'] },
+        });
+        if (filePath === CONFIG_FILE) return JSON.stringify({ syncRepo: SYNC_REPO, syncTag: 'sync' });
+        if (filePath === SYNC_FILE) return JSON.stringify(remoteData);
+        return '';
+      });
+
+      await runCommand(['sync', 'status']);
+
+      const output = consoleOutput.join('\n');
+      expect(output).toContain('gp');
+      expect(output).toContain('remote only');
+      expect(output).toContain('gl');
+      expect(output).toContain('local only');
+      expect(output).toContain('Summary');
+    });
+
+    it('errors when sync not configured', async () => {
+      vi.mocked(fs.existsSync).mockImplementation((filePath) => {
+        if (filePath === CONFIG_FILE) return false;
+        return true;
+      });
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        if (filePath === ALIASES_FILE) return '# Managed\n';
+        if (filePath === METADATA_FILE) return '{}';
+        if (filePath === CONFIG_FILE) return '{}';
+        return '';
+      });
+
+      await runCommand(['sync', 'status']);
+
+      expect(consoleErrors.join(' ')).toContain('Sync not configured');
+    });
+  });
+
+  describe('sync dry-run', () => {
+    it('push dry-run shows what would be pushed', async () => {
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        if (filePath === ALIASES_FILE) return "# Managed\nalias gs='git status'";
+        if (filePath === METADATA_FILE) return JSON.stringify({ gs: { tags: ['sync'] } });
+        if (filePath === CONFIG_FILE) return JSON.stringify({ syncRepo: SYNC_REPO, syncTag: 'sync' });
+        return '';
+      });
+
+      await runCommand(['--dry-run', 'sync', 'push']);
+
+      expect(consoleOutput.join(' ')).toContain('[Dry Run]');
+      expect(consoleOutput.join(' ')).toContain('Would push');
+      expect(spawnSyncMock).not.toHaveBeenCalled();
+    });
+
+    it('pull dry-run shows what would be pulled', async () => {
+      const remoteData = {
+        version: 1,
+        exportedAt: '2024-01-01T00:00:00.000Z',
+        aliases: [
+          { name: 'gp', command: 'git push', tags: ['sync'] },
+        ],
+      };
+
+      vi.mocked(fs.existsSync).mockReturnValue(true);
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+        if (filePath === ALIASES_FILE) return '# Managed\n';
+        if (filePath === METADATA_FILE) return '{}';
+        if (filePath === CONFIG_FILE) return JSON.stringify({ syncRepo: SYNC_REPO, syncTag: 'sync' });
+        if (filePath === SYNC_FILE) return JSON.stringify(remoteData);
+        return '';
+      });
+
+      await runCommand(['--dry-run', 'sync', 'pull']);
+
+      expect(consoleOutput.join(' ')).toContain('[Dry Run]');
+      expect(consoleOutput.join(' ')).toContain('Would pull');
+      expect(consoleOutput.join(' ')).toContain('gp');
+    });
   });
 });

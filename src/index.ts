@@ -4,8 +4,8 @@ import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { spawn } from 'child_process';
-import { select, input, confirm as askConfirm, search } from '@inquirer/prompts';
+import { spawn, spawnSync } from 'child_process';
+import { select, input, confirm as askConfirm, search, checkbox } from '@inquirer/prompts';
 import { fileURLToPath } from 'url';
 
 // Read version from package.json
@@ -17,6 +17,7 @@ const VERSION = packageJson.version;
 export const ZAM_DIR = path.join(os.homedir(), '.zam');
 export const BACKUPS_DIR = path.join(ZAM_DIR, 'backups');
 export const METADATA_FILE = path.join(ZAM_DIR, 'metadata.json');
+export const CONFIG_FILE = path.join(ZAM_DIR, 'config.json');
 export const ALIASES_FILE = path.join(os.homedir(), '.zsh_aliases_managed');
 export const ZSHRC_FILE = path.join(os.homedir(), '.zshrc');
 
@@ -50,6 +51,11 @@ export interface AliasMetadata {
 
 export interface MetadataMap {
   [aliasName: string]: AliasMetadata;
+}
+
+export interface ZamConfig {
+  syncRepo?: string;
+  syncTag?: string;  // defaults to 'sync'
 }
 
 // Normalize tags from metadata (handles legacy single tag)
@@ -112,6 +118,24 @@ function readMetadata(): MetadataMap {
 function writeMetadata(metadata: MetadataMap) {
   ensureZamDir();
   fs.writeFileSync(METADATA_FILE, JSON.stringify(metadata, null, 2), 'utf8');
+}
+
+function readConfig(): ZamConfig {
+  ensureZamDir();
+  if (!fs.existsSync(CONFIG_FILE)) {
+    return {};
+  }
+  try {
+    const content = fs.readFileSync(CONFIG_FILE, 'utf8');
+    return JSON.parse(content);
+  } catch {
+    return {};
+  }
+}
+
+function writeConfig(config: ZamConfig) {
+  ensureZamDir();
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
 }
 
 // Update metadata for a single alias
@@ -265,6 +289,25 @@ function writeAliases(aliases: AliasMap) {
   }
 }
 
+function runGit(args: string[], cwd: string): { success: boolean; output: string; error: string } {
+  try {
+    const result = spawnSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+    });
+    return {
+      success: result.status === 0,
+      output: (result.stdout || '').trim(),
+      error: (result.stderr || '').trim(),
+    };
+  } catch (err: any) {
+    if (err.code === 'ENOENT') {
+      return { success: false, output: '', error: 'git is not installed or not in PATH' };
+    }
+    return { success: false, output: '', error: err.message };
+  }
+}
+
 // --- Commands ---
 
 program
@@ -272,6 +315,7 @@ program
   .argument('<name>', 'Name of the alias')
   .argument('<command>', 'Command to run')
   .option('-t, --tag <tag...>', 'Tag(s) for the alias (can be used multiple times)')
+  .option('-s, --sync', 'Tag alias for sync (adds the configured sync tag)')
   .description('Add a new alias')
   .action((name, command, options) => {
     try {
@@ -285,12 +329,20 @@ program
       // Save metadata (tags and created date)
       if (!getOptions().dryRun) {
         const metaData: AliasMetadata = { created: new Date().toISOString() };
-        if (options.tag && options.tag.length > 0) {
-          metaData.tags = options.tag;
+        const tags = [...(options.tag || [])];
+        if (options.sync) {
+          const config = readConfig();
+          const syncTag = config.syncTag || 'sync';
+          if (!tags.some(t => t.toLowerCase() === syncTag.toLowerCase())) {
+            tags.push(syncTag);
+          }
+        }
+        if (tags.length > 0) {
+          metaData.tags = tags;
         }
         setAliasMetadata(name, metaData);
 
-        const tagInfo = options.tag?.length ? chalk.dim(` [${options.tag.join(', ')}]`) : '';
+        const tagInfo = tags.length ? chalk.dim(` [${tags.join(', ')}]`) : '';
         console.log(chalk.green(`Alias '${name}' added successfully!${tagInfo}`));
       }
     } catch (err: any) {
@@ -525,6 +577,99 @@ program
     runRestore(file);
   });
 
+async function runSyncSelect() {
+  try {
+    const options = getOptions();
+    const config = readConfig();
+
+    if (!config.syncRepo) {
+      console.error(chalk.red('Sync not configured. Run `zam sync init <path>` first.'));
+      return;
+    }
+
+    const syncTag = config.syncTag || 'sync';
+    const aliases = readAliases(true);
+    const metadata = readMetadata();
+    const names = Object.keys(aliases).sort();
+
+    if (names.length === 0) {
+      console.log(chalk.yellow('No aliases found.'));
+      return;
+    }
+
+    const selected = await checkbox({
+      message: `Select aliases to tag for sync [${syncTag}] (space to toggle):`,
+      choices: names.map(name => ({
+        name: `${name} = ${aliases[name]}`,
+        value: name,
+        checked: aliasHasTag(metadata[name], syncTag),
+      })),
+      loop: false,
+    });
+
+    if (options.dryRun) {
+      const currentSynced = names.filter(n => aliasHasTag(metadata[n], syncTag));
+      const toAdd = selected.filter(n => !aliasHasTag(metadata[n], syncTag));
+      const toRemove = currentSynced.filter(n => !selected.includes(n));
+      if (toAdd.length > 0) {
+        console.log(chalk.blue(`[Dry Run] Would add tag '${syncTag}' to: ${toAdd.join(', ')}`));
+      }
+      if (toRemove.length > 0) {
+        console.log(chalk.blue(`[Dry Run] Would remove tag '${syncTag}' from: ${toRemove.join(', ')}`));
+      }
+      if (toAdd.length === 0 && toRemove.length === 0) {
+        console.log(chalk.dim('No changes.'));
+      }
+      return;
+    }
+
+    let added = 0;
+    let removed = 0;
+
+    for (const name of names) {
+      const isSynced = aliasHasTag(metadata[name], syncTag);
+      const shouldBeSynced = selected.includes(name);
+
+      if (shouldBeSynced && !isSynced) {
+        const tags = getAliasTags(metadata[name]);
+        tags.push(syncTag);
+        metadata[name] = { ...metadata[name], tags };
+        delete metadata[name].tag;
+        added++;
+      } else if (!shouldBeSynced && isSynced) {
+        const tags = getAliasTags(metadata[name]).filter(t => t.toLowerCase() !== syncTag.toLowerCase());
+        if (tags.length === 0) {
+          const meta = metadata[name] || {};
+          delete meta.tags;
+          delete meta.tag;
+          metadata[name] = meta;
+        } else {
+          metadata[name] = { ...metadata[name], tags };
+          delete metadata[name].tag;
+        }
+        removed++;
+      }
+    }
+
+    writeMetadata(metadata);
+
+    if (added === 0 && removed === 0) {
+      console.log(chalk.dim('No changes.'));
+    } else {
+      const parts: string[] = [];
+      if (added > 0) parts.push(chalk.green(`${added} added`));
+      if (removed > 0) parts.push(chalk.red(`${removed} removed`));
+      console.log(`Sync tag updated: ${parts.join(', ')} (${selected.length} total synced).`);
+    }
+  } catch (err: any) {
+    if (err instanceof Error && err.name === 'ExitPromptError') {
+      console.log(chalk.blue('\nCancelled.'));
+      return;
+    }
+    console.error(chalk.red('Error selecting sync aliases:'), err.message);
+  }
+}
+
 program
   .command('edit')
   .argument('<name>', 'Name of the alias to edit')
@@ -582,6 +727,8 @@ program
   .option('-a, --add <tags...>', 'Add tags to existing')
   .option('-r, --remove <tags...>', 'Remove specific tags')
   .option('-c, --clear', 'Clear all tags')
+  .option('--sync', 'Add the configured sync tag to this alias')
+  .option('--no-sync', 'Remove the configured sync tag from this alias')
   .description('View or edit tags for an alias')
   .action((name, options) => {
     try {
@@ -595,7 +742,7 @@ program
       const currentTags = getAliasTags(metadata[name]);
 
       // If no options provided, just show current tags
-      if (!options.set && !options.add && !options.remove && !options.clear) {
+      if (!options.set && !options.add && !options.remove && !options.clear && !options.sync && options.sync !== false) {
         if (currentTags.length === 0) {
           console.log(chalk.yellow(`Alias '${name}' has no tags.`));
         } else {
@@ -604,8 +751,14 @@ program
         return;
       }
 
+      const syncTag = readConfig().syncTag || 'sync';
+
       if (getOptions().dryRun) {
-        if (options.clear) {
+        if (options.sync === false) {
+          console.log(chalk.blue(`[Dry Run] Would remove tag '${syncTag}' from '${name}'`));
+        } else if (options.sync) {
+          console.log(chalk.blue(`[Dry Run] Would add tag '${syncTag}' to '${name}'`));
+        } else if (options.clear) {
           console.log(chalk.blue(`[Dry Run] Would clear tags for '${name}'`));
         } else if (options.set) {
           console.log(chalk.blue(`[Dry Run] Would set tags for '${name}' to: ${options.set.join(', ')}`));
@@ -619,10 +772,16 @@ program
 
       let newTags: string[] = [...currentTags];
 
-      if (options.clear) {
+      if (options.sync === false) {
+        newTags = newTags.filter(t => t.toLowerCase() !== syncTag.toLowerCase());
+      } else if (options.clear) {
         newTags = [];
       } else if (options.set) {
         newTags = options.set;
+      } else if (options.sync) {
+        if (!newTags.some(t => t.toLowerCase() === syncTag.toLowerCase())) {
+          newTags.push(syncTag);
+        }
       } else if (options.add) {
         // Add tags that don't already exist (case-insensitive check)
         for (const tag of options.add) {
@@ -658,6 +817,432 @@ program
     } catch (err: any) {
       console.error(chalk.red('Error updating tags:'), err.message);
     }
+  });
+
+function runDoctor() {
+  try {
+    const options = getOptions();
+
+    if (options.dryRun) {
+      console.log(chalk.blue('[Dry Run] Would run 7 health checks'));
+      return;
+    }
+
+    let issueCount = 0;
+
+    if (fs.existsSync(ALIASES_FILE)) {
+      console.log(chalk.green('  ✅ Aliases file exists'));
+    } else {
+      console.log(chalk.red(`  ❌ Aliases file not found at ${ALIASES_FILE}`));
+      issueCount++;
+    }
+
+    const zshrcExists = fs.existsSync(ZSHRC_FILE);
+    let zshrcContent = '';
+    if (zshrcExists) {
+      zshrcContent = fs.readFileSync(ZSHRC_FILE, 'utf8');
+    }
+
+    const sourceLine = `source ${ALIASES_FILE}`;
+    const sourceLineAlt = `source "${ALIASES_FILE}"`;
+    if (zshrcContent.includes(sourceLine) || zshrcContent.includes(sourceLineAlt)) {
+      console.log(chalk.green('  ✅ Source line found in .zshrc'));
+    } else {
+      console.log(chalk.yellow('  ⚠️  Source line not found in .zshrc (aliases will not be loaded)'));
+      issueCount++;
+    }
+
+    if (zshrcContent.includes(SHELL_WRAPPER_MARKER)) {
+      console.log(chalk.green('  ✅ Shell wrapper installed'));
+    } else {
+      console.log(chalk.yellow('  ⚠️  Shell wrapper not installed (aliases won\'t auto-refresh after changes)'));
+      issueCount++;
+    }
+
+    const aliases = fs.existsSync(ALIASES_FILE)
+      ? parseAliases(fs.readFileSync(ALIASES_FILE, 'utf8'))
+      : {};
+    const metadata = readMetadata();
+    const orphanedKeys = Object.keys(metadata).filter(name => !aliases[name]);
+    if (orphanedKeys.length === 0) {
+      console.log(chalk.green('  ✅ No orphaned metadata entries'));
+    } else {
+      for (const key of orphanedKeys) {
+        console.log(chalk.yellow(`  ⚠️  Orphaned metadata for '${key}'`));
+      }
+      issueCount += orphanedKeys.length;
+    }
+
+    const aliasNames = Object.keys(aliases);
+    const conflictingAliases: string[] = [];
+    if (zshrcExists && zshrcContent) {
+      const lines = zshrcContent.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('alias ') || trimmed.startsWith('#')) continue;
+        const eqIndex = trimmed.indexOf('=');
+        if (eqIndex === -1) continue;
+        const name = trimmed.substring(6, eqIndex).trim();
+        if (aliasNames.includes(name)) {
+          conflictingAliases.push(name);
+        }
+      }
+    }
+    if (conflictingAliases.length === 0) {
+      console.log(chalk.green('  ✅ No conflicting aliases in .zshrc'));
+    } else {
+      for (const name of conflictingAliases) {
+        console.log(chalk.yellow(`  ⚠️  Conflicting alias '${name}' in .zshrc`));
+      }
+      issueCount += conflictingAliases.length;
+    }
+
+    if (fs.existsSync(BACKUPS_DIR)) {
+      console.log(chalk.green('  ✅ Backup directory exists'));
+    } else {
+      console.log(chalk.yellow('  ⚠️  Backup directory not found'));
+      issueCount++;
+    }
+
+    if (fs.existsSync(METADATA_FILE)) {
+      try {
+        const metaContent = fs.readFileSync(METADATA_FILE, 'utf8');
+        JSON.parse(metaContent);
+        console.log(chalk.green('  ✅ Metadata file is valid JSON'));
+      } catch {
+        console.log(chalk.red('  ❌ Metadata file contains invalid JSON'));
+        issueCount++;
+      }
+    } else {
+      console.log(chalk.green('  ✅ Metadata file is valid JSON'));
+    }
+
+    if (issueCount === 0) {
+      console.log(chalk.green('\nAll checks passed.'));
+    } else {
+      console.log(chalk.yellow(`\nFound ${issueCount} issue(s).`));
+    }
+  } catch (err: any) {
+    console.error(chalk.red('Error running doctor:'), err.message);
+  }
+}
+
+program
+  .command('doctor')
+  .description('Run health checks on your zam setup')
+  .action(() => {
+    runDoctor();
+  });
+
+// --- Sync commands ---
+
+const SYNC_ALIASES_FILE = 'aliases.json';
+
+const syncCommand = program.command('sync').description('Sync aliases with a git repository');
+
+syncCommand
+  .command('init')
+  .argument('<path>', 'Path to git repository')
+  .description('Configure sync with a git repository')
+  .action((repoPath) => {
+    try {
+      const options = getOptions();
+      const resolvedPath = path.resolve(repoPath);
+
+      if (!fs.existsSync(resolvedPath)) {
+        console.error(chalk.red(`Directory not found: ${resolvedPath}`));
+        return;
+      }
+
+      const gitPath = path.join(resolvedPath, '.git');
+      if (!fs.existsSync(gitPath)) {
+        console.error(chalk.red(`Not a git repository: ${resolvedPath}`));
+        return;
+      }
+
+      if (options.dryRun) {
+        console.log(chalk.blue(`[Dry Run] Would configure sync with repo: ${resolvedPath}, tag: sync`));
+        return;
+      }
+
+      writeConfig({ syncRepo: resolvedPath, syncTag: 'sync' });
+      console.log(chalk.green(`Sync configured. Repo: ${resolvedPath}, Tag: sync`));
+    } catch (err: any) {
+      console.error(chalk.red('Error configuring sync:'), err.message);
+    }
+  });
+
+syncCommand
+  .command('push')
+  .option('--tag <tag>', 'Tag to sync (overrides configured tag)')
+  .description('Push tagged aliases to the sync repository')
+  .action((cmdOptions) => {
+    try {
+      const options = getOptions();
+      const config = readConfig();
+
+      if (!config.syncRepo) {
+        console.error(chalk.red('Sync not configured. Run `zam sync init <path>` first.'));
+        return;
+      }
+
+      const tag = cmdOptions.tag || config.syncTag || 'sync';
+      const aliases = readAliases(true);
+      const metadata = readMetadata();
+
+      const taggedEntries = Object.entries(aliases).filter(
+        ([name]) => aliasHasTag(metadata[name], tag)
+      );
+
+      if (taggedEntries.length === 0) {
+        console.log(chalk.yellow(`No aliases tagged '${tag}' to push.`));
+        return;
+      }
+
+      const exportedAliases = taggedEntries.map(([name, command]) => ({
+        name,
+        command,
+        tags: getAliasTags(metadata[name]),
+        created: metadata[name]?.created,
+      }));
+
+      const syncData = {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        aliases: exportedAliases,
+      };
+
+      const syncFilePath = path.join(config.syncRepo, SYNC_ALIASES_FILE);
+
+      if (options.dryRun) {
+        console.log(chalk.blue(`[Dry Run] Would push ${exportedAliases.length} aliases to ${config.syncRepo}`));
+        for (const alias of exportedAliases) {
+          console.log(chalk.dim(`  ${alias.name} = ${alias.command}`));
+        }
+        return;
+      }
+
+      fs.writeFileSync(syncFilePath, JSON.stringify(syncData, null, 2), 'utf8');
+
+      const addResult = runGit(['add', SYNC_ALIASES_FILE], config.syncRepo);
+      if (!addResult.success) {
+        console.error(chalk.red(`git add failed: ${addResult.error}`));
+        return;
+      }
+
+      const commitResult = runGit(['commit', '-m', 'zam sync: update aliases'], config.syncRepo);
+      if (!commitResult.success) {
+        if (commitResult.output.includes('nothing to commit') || commitResult.error.includes('nothing to commit')) {
+          console.log(chalk.yellow('Nothing to commit — aliases unchanged.'));
+          return;
+        }
+        console.error(chalk.red(`git commit failed: ${commitResult.error}`));
+        return;
+      }
+
+      const pushResult = runGit(['push'], config.syncRepo);
+      if (!pushResult.success) {
+        console.error(chalk.red(`git push failed: ${pushResult.error}`));
+        return;
+      }
+
+      console.log(chalk.green(`Pushed ${exportedAliases.length} aliases to ${config.syncRepo}`));
+    } catch (err: any) {
+      console.error(chalk.red('Error pushing aliases:'), err.message);
+    }
+  });
+
+syncCommand
+  .command('pull')
+  .option('--tag <tag>', 'Tag to sync (overrides configured tag)')
+  .description('Pull aliases from the sync repository')
+  .action(async (cmdOptions) => {
+    try {
+      const options = getOptions();
+      const config = readConfig();
+
+      if (!config.syncRepo) {
+        console.error(chalk.red('Sync not configured. Run `zam sync init <path>` first.'));
+        return;
+      }
+
+      const tag = cmdOptions.tag || config.syncTag || 'sync';
+
+      if (options.dryRun) {
+        const syncFilePath = path.join(config.syncRepo, SYNC_ALIASES_FILE);
+        if (!fs.existsSync(syncFilePath)) {
+          console.log(chalk.yellow('No aliases.json found in sync repository.'));
+          return;
+        }
+        const syncContent = fs.readFileSync(syncFilePath, 'utf8');
+        const syncData = JSON.parse(syncContent);
+        console.log(chalk.blue(`[Dry Run] Would pull ${syncData.aliases?.length || 0} aliases from ${config.syncRepo}`));
+        if (syncData.aliases) {
+          for (const alias of syncData.aliases) {
+            console.log(chalk.dim(`  ${alias.name} = ${alias.command}`));
+          }
+        }
+        return;
+      }
+
+      const pullResult = runGit(['pull'], config.syncRepo);
+      if (!pullResult.success) {
+        console.error(chalk.red(`git pull failed: ${pullResult.error}`));
+        return;
+      }
+
+      const syncFilePath = path.join(config.syncRepo, SYNC_ALIASES_FILE);
+      if (!fs.existsSync(syncFilePath)) {
+        console.log(chalk.yellow('No aliases.json found in sync repository.'));
+        return;
+      }
+
+      const syncContent = fs.readFileSync(syncFilePath, 'utf8');
+      const syncData = JSON.parse(syncContent);
+
+      if (!syncData.aliases || syncData.aliases.length === 0) {
+        console.log(chalk.yellow('No aliases found in sync file.'));
+        return;
+      }
+
+      const aliases = readAliases(true);
+      const metadata = readMetadata();
+      let imported = 0;
+      let conflicts = 0;
+      let unchanged = 0;
+
+      for (const remoteAlias of syncData.aliases) {
+        const localCommand = aliases[remoteAlias.name];
+
+        if (!localCommand) {
+          aliases[remoteAlias.name] = remoteAlias.command;
+          if (remoteAlias.tags) {
+            metadata[remoteAlias.name] = {
+              ...metadata[remoteAlias.name],
+              tags: remoteAlias.tags,
+              created: remoteAlias.created || metadata[remoteAlias.name]?.created,
+            };
+          } else {
+            metadata[remoteAlias.name] = {
+              ...metadata[remoteAlias.name],
+              created: remoteAlias.created || metadata[remoteAlias.name]?.created,
+            };
+          }
+          console.log(chalk.green(`  + ${remoteAlias.name} = ${remoteAlias.command}`));
+          imported++;
+        } else if (localCommand === remoteAlias.command) {
+          console.log(chalk.dim(`  = ${remoteAlias.name} (unchanged)`));
+          unchanged++;
+        } else {
+          const choice = await select({
+            message: `Conflict for '${remoteAlias.name}': local='${localCommand}' remote='${remoteAlias.command}'`,
+            choices: [
+              { name: `Keep local: ${localCommand}`, value: 'local' },
+              { name: `Take remote: ${remoteAlias.command}`, value: 'remote' },
+              { name: 'Skip', value: 'skip' },
+            ],
+          });
+
+          if (choice === 'remote') {
+            aliases[remoteAlias.name] = remoteAlias.command;
+            if (remoteAlias.tags) {
+              metadata[remoteAlias.name] = {
+                ...metadata[remoteAlias.name],
+                tags: remoteAlias.tags,
+                created: remoteAlias.created || metadata[remoteAlias.name]?.created,
+              };
+            }
+            console.log(chalk.cyan(`  ~ ${remoteAlias.name} = ${remoteAlias.command} (took remote)`));
+            conflicts++;
+          } else if (choice === 'local') {
+            console.log(chalk.dim(`  ~ ${remoteAlias.name} = ${localCommand} (kept local)`));
+            conflicts++;
+          } else {
+            console.log(chalk.dim(`  ~ ${remoteAlias.name} (skipped)`));
+            conflicts++;
+          }
+        }
+      }
+
+      writeAliases(aliases);
+      writeMetadata(metadata);
+
+      console.log(chalk.green(`\nImported ${imported} new, resolved ${conflicts} conflicts, skipped ${unchanged} unchanged.`));
+    } catch (err: any) {
+      if (err instanceof Error && err.name === 'ExitPromptError') {
+        console.log(chalk.blue('\nCancelled.'));
+        return;
+      }
+      console.error(chalk.red('Error pulling aliases:'), err.message);
+    }
+  });
+
+syncCommand
+  .command('status')
+  .option('--tag <tag>', 'Tag to sync (overrides configured tag)')
+  .description('Show sync status between local and remote aliases')
+  .action((cmdOptions) => {
+    try {
+      const config = readConfig();
+
+      if (!config.syncRepo) {
+        console.error(chalk.red('Sync not configured. Run `zam sync init <path>` first.'));
+        return;
+      }
+
+      const tag = cmdOptions.tag || config.syncTag || 'sync';
+
+      const syncFilePath = path.join(config.syncRepo, SYNC_ALIASES_FILE);
+      let remoteAliases: { name: string; command: string; tags?: string[]; created?: string }[] = [];
+
+      if (fs.existsSync(syncFilePath)) {
+        const syncContent = fs.readFileSync(syncFilePath, 'utf8');
+        const syncData = JSON.parse(syncContent);
+        remoteAliases = syncData.aliases || [];
+      }
+
+      const aliases = readAliases(true);
+      const metadata = readMetadata();
+
+      const localTagged = Object.entries(aliases)
+        .filter(([name]) => aliasHasTag(metadata[name], tag))
+        .map(([name, command]) => ({ name, command }));
+
+      const remoteMap = new Map(remoteAliases.map(a => [a.name, a.command]));
+      const localMap = new Map(localTagged.map(a => [a.name, a.command]));
+
+      const onlyRemote = remoteAliases.filter(a => !localMap.has(a.name));
+      const onlyLocal = localTagged.filter(a => !remoteMap.has(a.name));
+      const both = remoteAliases.filter(a => localMap.has(a.name));
+      const different = both.filter(a => localMap.get(a.name) !== a.command);
+      const same = both.filter(a => localMap.get(a.name) === a.command);
+
+      console.log(chalk.bold('Sync status:'));
+
+      for (const a of onlyRemote) {
+        console.log(chalk.green(`  + ${a.name} = ${a.command} (remote only)`));
+      }
+      for (const a of onlyLocal) {
+        console.log(chalk.red(`  - ${a.name} = ${a.command} (local only)`));
+      }
+      for (const a of different) {
+        console.log(chalk.yellow(`  ~ ${a.name}: local='${localMap.get(a.name)}' remote='${a.command}'`));
+      }
+      for (const a of same) {
+        console.log(chalk.dim(`  = ${a.name} = ${a.command}`));
+      }
+
+      console.log(chalk.bold(`\nSummary: ${onlyRemote.length} to pull, ${onlyLocal.length} to push, ${different.length} conflicts, ${same.length} in sync.`));
+    } catch (err: any) {
+      console.error(chalk.red('Error checking sync status:'), err.message);
+    }
+  });
+
+syncCommand
+  .command('select')
+  .description('Interactively select which aliases to sync')
+  .action(() => {
+    runSyncSelect();
   });
 
 function runImport() {
@@ -787,6 +1372,7 @@ program
               { name: 'Delete Alias', value: 'Delete Alias' },
               { name: 'Rename Alias', value: 'Rename Alias' },
               { name: 'List All', value: 'List All' },
+              { name: 'Toggle Sync', value: 'Toggle Sync' },
               { name: 'Import from .zshrc', value: 'Import from .zshrc' },
               { name: 'Backup/Restore', value: 'Backup/Restore' },
               { name: 'Exit', value: 'Exit' }
@@ -801,6 +1387,9 @@ program
 
         if (action === 'Import from .zshrc') {
           runImport();
+        }
+        else if (action === 'Toggle Sync') {
+          await runSyncSelect();
         }
         else if (action === 'Backup/Restore') {
           const subAction = await select({
