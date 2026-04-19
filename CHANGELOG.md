@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.3.0...v1.4.0) (2026-04-19)
+
+
+### Features
+
+* add doctor health checks and git-based sync commands ([b5745de](https://github.com/Lander-Parren/zsh-alias-manager/commit/b5745de7e2026a0976daeac74fe157f7abbd616a))
+
 ## [1.3.0](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.2.0...v1.3.0) (2026-01-02)
 
 
