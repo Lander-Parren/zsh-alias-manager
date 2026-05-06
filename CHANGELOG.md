@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.4.0...v1.5.0) (2026-05-06)
+
+
+### Features
+
+* make project setups reopen layouts ([5b4b9e8](https://github.com/Lander-Parren/zsh-alias-manager/commit/5b4b9e8ead1a4761d89684a712bdfc36e3da90d5))
+
 ## [1.4.0](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.3.0...v1.4.0) (2026-04-19)
 
 
