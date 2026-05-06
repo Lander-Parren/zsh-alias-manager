@@ -4,6 +4,22 @@ import path from 'path';
 import os from 'os';
 import { spawnSync as actualSpawnSync } from 'child_process';
 
+const promptMocks = vi.hoisted(() => ({
+  select: vi.fn(),
+  input: vi.fn(),
+  confirm: vi.fn(),
+  search: vi.fn(),
+  checkbox: vi.fn(),
+}));
+
+vi.mock('@inquirer/prompts', () => ({
+  select: promptMocks.select,
+  input: promptMocks.input,
+  confirm: promptMocks.confirm,
+  search: promptMocks.search,
+  checkbox: promptMocks.checkbox,
+}));
+
 // Mock fs module - need to handle package.json read at module load time
 vi.mock('fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs')>();
@@ -54,7 +70,19 @@ vi.mock('child_process', async (importOriginal) => {
   };
 });
 
-import { parseAliases, program, ALIASES_FILE, ZSHRC_FILE, ZAM_DIR, BACKUPS_DIR, METADATA_FILE, CONFIG_FILE } from '../src/index.js';
+import {
+  parseAliases,
+  program,
+  ALIASES_FILE,
+  ZSHRC_FILE,
+  ZAM_DIR,
+  BACKUPS_DIR,
+  METADATA_FILE,
+  CONFIG_FILE,
+  LAYOUTS_FILE,
+  resolveProjectWindows,
+  type LayoutStore,
+} from '../src/index.js';
 
 // Mock zshrc content that includes both source line and shell wrapper
 const MOCK_ZSHRC = `source ${ALIASES_FILE}
@@ -163,6 +191,294 @@ source ~/.bashrc`;
 # Comment 2`;
     const result = parseAliases(content);
     expect(result).toEqual({});
+  });
+});
+
+describe('layout store helpers', () => {
+  it('resolves project windows from a template', () => {
+    const store: LayoutStore = {
+      version: 1,
+      templates: {
+        dev: {
+          name: 'dev',
+          created: '2024-01-01T00:00:00.000Z',
+          updated: '2024-01-01T00:00:00.000Z',
+          windows: [
+            {
+              id: 'Cursor:1:repo',
+              appName: 'Cursor',
+              title: 'repo',
+              desktopId: 'visible',
+              desktopName: 'Visible Desktop',
+              index: 1,
+              x: 0,
+              y: 0,
+              width: 1200,
+              height: 900,
+            },
+          ],
+        },
+      },
+      projects: {},
+    };
+
+    expect(resolveProjectWindows({
+      name: 'app',
+      cwd: '/repo',
+      templateName: 'dev',
+      created: '2024-01-01T00:00:00.000Z',
+      updated: '2024-01-01T00:00:00.000Z',
+    }, store)).toHaveLength(1);
+  });
+
+  it('prefers project-specific captured windows over template windows', () => {
+    const store: LayoutStore = {
+      version: 1,
+      templates: {
+        dev: {
+          name: 'dev',
+          created: '2024-01-01T00:00:00.000Z',
+          updated: '2024-01-01T00:00:00.000Z',
+          windows: [],
+        },
+      },
+      projects: {},
+    };
+
+    const windows = resolveProjectWindows({
+      name: 'app',
+      cwd: '/repo',
+      templateName: 'dev',
+      created: '2024-01-01T00:00:00.000Z',
+      updated: '2024-01-01T00:00:00.000Z',
+      windows: [
+        {
+          id: 'Terminal:1:shell',
+          appName: 'Terminal',
+          title: 'shell',
+          desktopId: 'visible',
+          desktopName: 'Visible Desktop',
+          index: 1,
+          x: 10,
+          y: 20,
+          width: 800,
+          height: 600,
+        },
+      ],
+    }, store);
+
+    expect(windows[0].appName).toBe('Terminal');
+  });
+});
+
+describe('layout and project commands', () => {
+  let spawnSyncMock: ReturnType<typeof vi.fn>;
+
+  const capturedWindows = [
+    {
+      id: 'Cursor:1:repo',
+      appName: 'Cursor',
+      title: 'repo',
+      desktopId: 'visible',
+      desktopName: 'Visible Desktop',
+      index: 1,
+      x: 0,
+      y: 0,
+      width: 1200,
+      height: 900,
+    },
+    {
+      id: 'Terminal:1:shell',
+      appName: 'Terminal',
+      title: 'shell',
+      desktopId: 'visible',
+      desktopName: 'Visible Desktop',
+      index: 1,
+      x: 1200,
+      y: 0,
+      width: 720,
+      height: 900,
+    },
+  ];
+
+  const templateStore = {
+    version: 1,
+    templates: {
+      dev: {
+        name: 'dev',
+        created: '2024-01-01T00:00:00.000Z',
+        updated: '2024-01-01T00:00:00.000Z',
+        windows: capturedWindows,
+      },
+    },
+    projects: {},
+  };
+
+  const projectStore = {
+    version: 1,
+    templates: templateStore.templates,
+    projects: {
+      app: {
+        name: 'app',
+        cwd: '/mock/repo',
+        aliasName: 'app',
+        templateName: 'dev',
+        created: '2024-01-01T00:00:00.000Z',
+        updated: '2024-01-01T00:00:00.000Z',
+      },
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockConsole();
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+    vi.mocked(fs.mkdirSync).mockImplementation(() => undefined);
+    vi.mocked(fs.realpathSync).mockImplementation(() => { throw new Error('mock'); });
+    promptMocks.checkbox.mockResolvedValueOnce(['visible']);
+    promptMocks.checkbox.mockResolvedValueOnce(['Cursor:1:repo']);
+
+    spawnSyncMock = vi.mocked(actualSpawnSync);
+    spawnSyncMock.mockImplementation((command: string, args: string[]) => {
+      if (command === 'osascript' && args.includes('-l')) {
+        return { status: 0, stdout: JSON.stringify(capturedWindows), stderr: '' } as any;
+      }
+      return { status: 0, stdout: 'ok', stderr: '' } as any;
+    });
+
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+      if (filePath === ALIASES_FILE) return '# Managed\n';
+      if (filePath === METADATA_FILE) return '{}';
+      if (filePath === LAYOUTS_FILE) return JSON.stringify(templateStore);
+      return '';
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('captures selected windows into a layout template', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+      if (filePath === ALIASES_FILE) return '# Managed\n';
+      if (filePath === METADATA_FILE) return '{}';
+      if (filePath === LAYOUTS_FILE) return JSON.stringify({ version: 1, templates: {}, projects: {} });
+      return '';
+    });
+
+    await runCommand(['layout', 'capture', 'dev']);
+
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      LAYOUTS_FILE,
+      expect.stringContaining('"dev"'),
+      'utf8'
+    );
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      LAYOUTS_FILE,
+      expect.stringContaining('"appName": "Cursor"'),
+      'utf8'
+    );
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      LAYOUTS_FILE,
+      expect.not.stringContaining('"appName": "Terminal"'),
+      'utf8'
+    );
+    expect(consoleOutput.join(' ')).toContain("Layout template 'dev' saved");
+  });
+
+  it('creates a project from a template and generates an alias', async () => {
+    await runCommand(['project', 'create', 'app', '--template', 'dev', '--cwd', '/mock/repo']);
+
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      LAYOUTS_FILE,
+      expect.stringContaining('"templateName": "dev"'),
+      'utf8'
+    );
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      ALIASES_FILE,
+      expect.stringContaining("alias app='zam project open app'"),
+      'utf8'
+    );
+    expect(fs.writeFileSync).toHaveBeenCalledWith(
+      METADATA_FILE,
+      expect.stringContaining('"project"'),
+      'utf8'
+    );
+  });
+
+  it('reports missing templates when creating a project', async () => {
+    await runCommand(['project', 'create', 'app', '--template', 'missing', '--cwd', '/mock/repo']);
+
+    expect(consoleErrors.join(' ')).toContain("Layout template 'missing' not found");
+  });
+
+  it('shows project open dry-run without launching apps', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+      if (filePath === ALIASES_FILE) return '# Managed\n';
+      if (filePath === METADATA_FILE) return '{}';
+      if (filePath === LAYOUTS_FILE) return JSON.stringify(projectStore);
+      return '';
+    });
+
+    await runCommand(['--dry-run', 'project', 'open', 'app']);
+
+    expect(consoleOutput.join(' ')).toContain('Would open');
+    expect(spawnSyncMock).not.toHaveBeenCalledWith('open', expect.anything(), expect.anything());
+  });
+
+  it('opens project apps and restores windows', async () => {
+    vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+      if (filePath === ZSHRC_FILE) return MOCK_ZSHRC;
+      if (filePath === ALIASES_FILE) return '# Managed\n';
+      if (filePath === METADATA_FILE) return '{}';
+      if (filePath === LAYOUTS_FILE) return JSON.stringify(projectStore);
+      return '';
+    });
+
+    await runCommand(['project', 'open', 'app']);
+
+    expect(spawnSyncMock).toHaveBeenCalledWith('open', ['-a', 'Cursor', '/mock/repo'], expect.any(Object));
+    expect(spawnSyncMock).toHaveBeenCalledWith('osascript', expect.arrayContaining(['-e', expect.stringContaining('Terminal')]), expect.any(Object));
+    expect(consoleOutput.join(' ')).toContain("Opened project 'app'");
+  });
+
+  it('reports macOS automation permission errors clearly', async () => {
+    spawnSyncMock.mockImplementation((command: string) => {
+      if (command === 'osascript') {
+        return { status: 1, stdout: '', stderr: 'Not authorized to send Apple events to System Events.' } as any;
+      }
+      return { status: 0, stdout: '', stderr: '' } as any;
+    });
+
+    await runCommand(['layout', 'capture', 'dev']);
+
+    expect(consoleErrors.join(' ')).toContain('Grant Accessibility permission');
+  });
+
+  it('reports missing osascript clearly', async () => {
+    spawnSyncMock.mockImplementation((command: string) => {
+      if (command === 'osascript') {
+        return { status: null, stdout: '', stderr: '', error: new Error('spawn osascript ENOENT') } as any;
+      }
+      return { status: 0, stdout: '', stderr: '' } as any;
+    });
+
+    await runCommand(['layout', 'capture', 'dev']);
+
+    expect(consoleErrors.join(' ')).toContain('spawn osascript ENOENT');
+  });
+
+  it('honors dry-run when capturing a project', async () => {
+    await runCommand(['--dry-run', 'project', 'capture', 'app', '--cwd', '/mock/repo']);
+
+    expect(consoleOutput.join(' ')).toContain('[Dry Run]');
+    const layoutWrites = vi.mocked(fs.writeFileSync).mock.calls.filter(call => call[0] === LAYOUTS_FILE);
+    expect(layoutWrites).toHaveLength(0);
   });
 });
 

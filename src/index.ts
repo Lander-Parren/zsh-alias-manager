@@ -18,6 +18,7 @@ export const ZAM_DIR = path.join(os.homedir(), '.zam');
 export const BACKUPS_DIR = path.join(ZAM_DIR, 'backups');
 export const METADATA_FILE = path.join(ZAM_DIR, 'metadata.json');
 export const CONFIG_FILE = path.join(ZAM_DIR, 'config.json');
+export const LAYOUTS_FILE = path.join(ZAM_DIR, 'layouts.json');
 export const ALIASES_FILE = path.join(os.homedir(), '.zsh_aliases_managed');
 export const ZSHRC_FILE = path.join(os.homedir(), '.zshrc');
 
@@ -32,7 +33,7 @@ zam() {
   local exit_code=$?
   if [[ $exit_code -eq 0 && -f ~/.zsh_aliases_managed ]]; then
     case "$1" in
-      add|remove|rename|restore|import|"")
+      add|remove|rename|restore|import|project|"")
         source ~/.zsh_aliases_managed
         ;;
     esac
@@ -56,6 +57,42 @@ export interface MetadataMap {
 export interface ZamConfig {
   syncRepo?: string;
   syncTag?: string;  // defaults to 'sync'
+}
+
+export interface WindowLayout {
+  id: string;
+  appName: string;
+  title: string;
+  desktopId: string;
+  desktopName: string;
+  index: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface LayoutTemplate {
+  name: string;
+  created: string;
+  updated: string;
+  windows: WindowLayout[];
+}
+
+export interface ProjectLayout {
+  name: string;
+  cwd: string;
+  aliasName?: string;
+  templateName?: string;
+  created: string;
+  updated: string;
+  windows?: WindowLayout[];
+}
+
+export interface LayoutStore {
+  version: 1;
+  templates: Record<string, LayoutTemplate>;
+  projects: Record<string, ProjectLayout>;
 }
 
 // Normalize tags from metadata (handles legacy single tag)
@@ -136,6 +173,53 @@ function readConfig(): ZamConfig {
 function writeConfig(config: ZamConfig) {
   ensureZamDir();
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
+}
+
+function emptyLayoutStore(): LayoutStore {
+  return { version: 1, templates: {}, projects: {} };
+}
+
+export function readLayoutStore(): LayoutStore {
+  ensureZamDir();
+  if (!fs.existsSync(LAYOUTS_FILE)) {
+    return emptyLayoutStore();
+  }
+  try {
+    const content = fs.readFileSync(LAYOUTS_FILE, 'utf8');
+    const parsed = JSON.parse(content);
+    return {
+      version: 1,
+      templates: parsed.templates || {},
+      projects: parsed.projects || {},
+    };
+  } catch {
+    return emptyLayoutStore();
+  }
+}
+
+function writeLayoutStore(store: LayoutStore) {
+  ensureZamDir();
+  fs.writeFileSync(LAYOUTS_FILE, JSON.stringify(store, null, 2), 'utf8');
+}
+
+function validateLayoutName(name: string, label: string) {
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+    throw new Error(`${label} may only contain letters, numbers, dots, dashes, and underscores.`);
+  }
+}
+
+export function resolveProjectWindows(project: ProjectLayout, store: LayoutStore): WindowLayout[] {
+  if (project.windows && project.windows.length > 0) {
+    return project.windows;
+  }
+  if (!project.templateName) {
+    return [];
+  }
+  const template = store.templates[project.templateName];
+  if (!template) {
+    throw new Error(`Template '${project.templateName}' not found for project '${project.name}'.`);
+  }
+  return template.windows;
 }
 
 // Update metadata for a single alias
@@ -306,6 +390,231 @@ function runGit(args: string[], cwd: string): { success: boolean; output: string
     }
     return { success: false, output: '', error: err.message };
   }
+}
+
+function runProcess(command: string, args: string[], cwd?: string): { success: boolean; output: string; error: string } {
+  try {
+    const result = spawnSync(command, args, {
+      cwd,
+      encoding: 'utf8',
+    });
+    if (result.error) {
+      return { success: false, output: '', error: result.error.message };
+    }
+    return {
+      success: result.status === 0,
+      output: (result.stdout || '').trim(),
+      error: (result.stderr || '').trim(),
+    };
+  } catch (err: any) {
+    if (err.code === 'ENOENT') {
+      return { success: false, output: '', error: `${command} is not installed or not in PATH` };
+    }
+    return { success: false, output: '', error: err.message };
+  }
+}
+
+function getMacAutomationError(error: string): string {
+  const lower = error.toLowerCase();
+  if (lower.includes('not authorized') || lower.includes('not allowed') || lower.includes('assistive') || lower.includes('accessibility')) {
+    return 'macOS denied window access. Grant Accessibility permission to your terminal app in System Settings > Privacy & Security > Accessibility.';
+  }
+  if (lower.includes('can’t set') || lower.includes("can't set") || lower.includes('invalid index')) {
+    return 'One or more windows could not be moved. Full-screen, minimized, or special app windows may not be scriptable.';
+  }
+  return error || 'Unknown macOS automation error.';
+}
+
+function ensureMacAutomationAvailable() {
+  if (process.platform !== 'darwin') {
+    throw new Error('Project layouts are macOS-only in v1.');
+  }
+  const result = runProcess('osascript', ['-e', 'return "ok"']);
+  if (!result.success) {
+    throw new Error(getMacAutomationError(result.error));
+  }
+}
+
+function runOsascript(script: string, language: 'AppleScript' | 'JavaScript' = 'AppleScript'): string {
+  ensureMacAutomationAvailable();
+  const args = language === 'JavaScript'
+    ? ['-l', 'JavaScript', '-e', script]
+    : script.split('\n').flatMap(line => ['-e', line]);
+  const result = runProcess('osascript', args);
+  if (!result.success) {
+    throw new Error(getMacAutomationError(result.error));
+  }
+  return result.output;
+}
+
+function captureVisibleWindows(): WindowLayout[] {
+  const script = `
+const systemEvents = Application('System Events');
+const windows = [];
+for (const proc of systemEvents.processes()) {
+  let appName = '';
+  let backgroundOnly = false;
+  let visible = true;
+  try { appName = String(proc.name()); } catch (_) { continue; }
+  try { backgroundOnly = Boolean(proc.backgroundOnly()); } catch (_) {}
+  try { visible = Boolean(proc.visible()); } catch (_) {}
+  if (!appName || backgroundOnly || !visible) continue;
+
+  let appWindows = [];
+  try { appWindows = proc.windows(); } catch (_) { continue; }
+  for (let i = 0; i < appWindows.length; i++) {
+    const win = appWindows[i];
+    let title = '';
+    let position;
+    let size;
+    try { title = String(win.name()); } catch (_) {}
+    try { position = win.position(); size = win.size(); } catch (_) { continue; }
+    const x = Number(position[0]);
+    const y = Number(position[1]);
+    const width = Number(size[0]);
+    const height = Number(size[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || width <= 0 || height <= 0) continue;
+    windows.push({
+      id: appName + ':' + (i + 1) + ':' + title,
+      appName,
+      title,
+      desktopId: 'visible',
+      desktopName: 'Visible Desktop',
+      index: i + 1,
+      x,
+      y,
+      width,
+      height
+    });
+  }
+}
+JSON.stringify(windows);
+`;
+  const output = runOsascript(script, 'JavaScript');
+  try {
+    return JSON.parse(output) as WindowLayout[];
+  } catch {
+    throw new Error('Could not parse captured window data from macOS.');
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function appleScriptString(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function isProjectAwareApp(appName: string): boolean {
+  return ['Visual Studio Code', 'Code', 'Cursor', 'Zed', 'Sublime Text', 'WebStorm', 'IntelliJ IDEA', 'PhpStorm', 'PyCharm'].some(
+    app => app.toLowerCase() === appName.toLowerCase()
+  );
+}
+
+function openAppForProject(appName: string, cwd: string) {
+  if (appName.toLowerCase() === 'terminal') {
+    runOsascript(`tell application "Terminal"
+  activate
+  do script ${appleScriptString(`cd ${shellQuote(cwd)}`)}
+end tell`);
+    return;
+  }
+
+  if (appName.toLowerCase() === 'iterm' || appName.toLowerCase() === 'iterm2') {
+    runOsascript(`tell application "iTerm"
+  activate
+  create window with default profile
+  tell current session of current window
+    write text ${appleScriptString(`cd ${shellQuote(cwd)}`)}
+  end tell
+end tell`);
+    return;
+  }
+
+  const args = ['-a', appName];
+  if (isProjectAwareApp(appName)) {
+    args.push(cwd);
+  }
+  const result = runProcess('open', args);
+  if (!result.success) {
+    throw new Error(result.error || `Could not open ${appName}.`);
+  }
+}
+
+function sleepSync(ms: number) {
+  if (process.env.NODE_ENV === 'test') return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function restoreWindows(windows: WindowLayout[]) {
+  const lines = ['tell application "System Events"'];
+  for (const win of windows) {
+    lines.push(`  if exists process ${appleScriptString(win.appName)} then`);
+    lines.push(`    tell process ${appleScriptString(win.appName)}`);
+    lines.push('      set targetWindow to missing value');
+    if (win.title) {
+      lines.push(`      try`);
+      lines.push(`        set targetWindow to first window whose name is ${appleScriptString(win.title)}`);
+      lines.push(`      end try`);
+    }
+    lines.push('      if targetWindow is missing value then');
+    lines.push(`        if (count of windows) >= ${win.index} then set targetWindow to window ${win.index}`);
+    lines.push('      end if');
+    lines.push('      if targetWindow is not missing value then');
+    lines.push(`        set position of targetWindow to {${Math.round(win.x)}, ${Math.round(win.y)}}`);
+    lines.push(`        set size of targetWindow to {${Math.round(win.width)}, ${Math.round(win.height)}}`);
+    lines.push('      end if');
+    lines.push('    end tell');
+    lines.push('  end if');
+  }
+  lines.push('end tell');
+  runOsascript(lines.join('\n'));
+}
+
+function uniqueAppNames(windows: WindowLayout[]): string[] {
+  return Array.from(new Set(windows.map(w => w.appName))).sort((a, b) => a.localeCompare(b));
+}
+
+async function selectCapturedWindows(windows: WindowLayout[]): Promise<WindowLayout[]> {
+  if (windows.length === 0) {
+    throw new Error('No visible scriptable windows found to capture.');
+  }
+
+  const desktopIds = Array.from(new Set(windows.map(w => w.desktopId)));
+  const selectedDesktops = await checkbox({
+    message: 'Which visible desktops/displays should be included?',
+    choices: desktopIds.map(id => {
+      const first = windows.find(w => w.desktopId === id)!;
+      const count = windows.filter(w => w.desktopId === id).length;
+      return {
+        name: `${first.desktopName} (${count} window${count === 1 ? '' : 's'})`,
+        value: id,
+        checked: true,
+      };
+    }),
+  });
+
+  const desktopFiltered = windows.filter(w => selectedDesktops.includes(w.desktopId));
+  if (desktopFiltered.length === 0) {
+    throw new Error('No desktops selected.');
+  }
+
+  const selectedWindowIds = await checkbox({
+    message: 'Which windows should be included?',
+    choices: desktopFiltered.map(w => ({
+      name: `${w.appName}${w.title ? ` — ${w.title}` : ''} (${w.x},${w.y} ${w.width}x${w.height})`,
+      value: w.id,
+      checked: true,
+    })),
+    loop: false,
+  });
+
+  const selected = desktopFiltered.filter(w => selectedWindowIds.includes(w.id));
+  if (selected.length === 0) {
+    throw new Error('No windows selected.');
+  }
+  return selected;
 }
 
 // --- Commands ---
@@ -934,6 +1243,348 @@ program
     runDoctor();
   });
 
+// --- Layout and project commands ---
+
+function printWindowSummary(windows: WindowLayout[]) {
+  for (const win of windows) {
+    const title = win.title ? ` — ${win.title}` : '';
+    console.log(`  ${chalk.cyan(win.appName)}${title} ${chalk.dim(`(${win.x},${win.y} ${win.width}x${win.height})`)}`);
+  }
+}
+
+function getProjectOpenCommand(name: string): string {
+  return `zam project open ${name}`;
+}
+
+function writeProjectAlias(projectName: string, aliasName: string) {
+  validateLayoutName(aliasName, 'Alias name');
+  const aliases = readAliases();
+  aliases[aliasName] = getProjectOpenCommand(projectName);
+  writeAliases(aliases);
+  setAliasMetadata(aliasName, { created: new Date().toISOString(), tags: ['project'] });
+}
+
+function removeProjectAlias(project: ProjectLayout) {
+  if (!project.aliasName) return;
+  const aliases = readAliases();
+  if (aliases[project.aliasName] === getProjectOpenCommand(project.name)) {
+    delete aliases[project.aliasName];
+    writeAliases(aliases);
+    removeAliasMetadata(project.aliasName);
+  }
+}
+
+async function captureWindowSelection(): Promise<WindowLayout[]> {
+  const windows = captureVisibleWindows();
+  return selectCapturedWindows(windows);
+}
+
+const layoutCommand = program.command('layout').description('Manage reusable macOS window layout templates');
+
+layoutCommand
+  .command('capture')
+  .argument('<name>', 'Template name')
+  .description('Capture visible windows into a reusable layout template')
+  .action(async (name) => {
+    try {
+      validateLayoutName(name, 'Template name');
+      const windows = await captureWindowSelection();
+      const store = readLayoutStore();
+      const now = new Date().toISOString();
+      const template: LayoutTemplate = {
+        name,
+        created: store.templates[name]?.created || now,
+        updated: now,
+        windows,
+      };
+
+      if (getOptions().dryRun) {
+        console.log(chalk.blue(`[Dry Run] Would save layout template '${name}' with ${windows.length} window(s).`));
+        printWindowSummary(windows);
+        return;
+      }
+
+      store.templates[name] = template;
+      writeLayoutStore(store);
+      console.log(chalk.green(`Layout template '${name}' saved with ${windows.length} window(s).`));
+    } catch (err: any) {
+      console.error(chalk.red('Error capturing layout:'), err.message);
+    }
+  });
+
+layoutCommand
+  .command('list')
+  .description('List layout templates')
+  .action(() => {
+    try {
+      const templates = Object.values(readLayoutStore().templates).sort((a, b) => a.name.localeCompare(b.name));
+      if (templates.length === 0) {
+        console.log(chalk.yellow('No layout templates found.'));
+        return;
+      }
+      console.log(chalk.bold('Layout Templates:'));
+      for (const template of templates) {
+        console.log(`  ${chalk.cyan(template.name)} ${chalk.dim(`${template.windows.length} window(s)`)}`);
+      }
+    } catch (err: any) {
+      console.error(chalk.red('Error listing layouts:'), err.message);
+    }
+  });
+
+layoutCommand
+  .command('show')
+  .argument('<name>', 'Template name')
+  .description('Show a layout template')
+  .action((name) => {
+    try {
+      const template = readLayoutStore().templates[name];
+      if (!template) {
+        console.error(chalk.red(`Layout template '${name}' not found.`));
+        return;
+      }
+      console.log(chalk.bold(`Layout Template: ${template.name}`));
+      console.log(chalk.dim(`Updated: ${template.updated}`));
+      printWindowSummary(template.windows);
+    } catch (err: any) {
+      console.error(chalk.red('Error showing layout:'), err.message);
+    }
+  });
+
+layoutCommand
+  .command('remove')
+  .argument('<name>', 'Template name')
+  .description('Remove a layout template')
+  .action((name) => {
+    try {
+      const store = readLayoutStore();
+      if (!store.templates[name]) {
+        console.error(chalk.red(`Layout template '${name}' not found.`));
+        return;
+      }
+
+      if (getOptions().dryRun) {
+        console.log(chalk.blue(`[Dry Run] Would remove layout template '${name}'.`));
+        return;
+      }
+
+      delete store.templates[name];
+      writeLayoutStore(store);
+      console.log(chalk.green(`Layout template '${name}' removed.`));
+    } catch (err: any) {
+      console.error(chalk.red('Error removing layout:'), err.message);
+    }
+  });
+
+const projectCommand = program.command('project').description('Manage project launch layouts');
+
+projectCommand
+  .command('capture')
+  .argument('<name>', 'Project name')
+  .option('--cwd <path>', 'Project working directory')
+  .option('--alias <alias>', 'Generated zsh alias name')
+  .option('--template <template>', 'Template this project is based on')
+  .option('--no-generate-alias', 'Do not create a generated zsh alias')
+  .description('Capture visible windows into a project layout')
+  .action(async (name, cmdOptions) => {
+    try {
+      validateLayoutName(name, 'Project name');
+      const aliasName = cmdOptions.alias || name;
+      const cwd = path.resolve(cmdOptions.cwd || process.cwd());
+      const store = readLayoutStore();
+      if (cmdOptions.template && !store.templates[cmdOptions.template]) {
+        console.error(chalk.red(`Layout template '${cmdOptions.template}' not found.`));
+        return;
+      }
+
+      const windows = await captureWindowSelection();
+      const now = new Date().toISOString();
+      const project: ProjectLayout = {
+        name,
+        cwd,
+        aliasName: cmdOptions.generateAlias === false ? undefined : aliasName,
+        templateName: cmdOptions.template,
+        created: store.projects[name]?.created || now,
+        updated: now,
+        windows,
+      };
+
+      if (getOptions().dryRun) {
+        console.log(chalk.blue(`[Dry Run] Would save project '${name}' with ${windows.length} window(s).`));
+        if (project.aliasName) console.log(chalk.blue(`[Dry Run] Would create alias '${project.aliasName}' = '${getProjectOpenCommand(name)}'.`));
+        printWindowSummary(windows);
+        return;
+      }
+
+      store.projects[name] = project;
+      writeLayoutStore(store);
+      if (project.aliasName) {
+        writeProjectAlias(name, project.aliasName);
+      }
+      console.log(chalk.green(`Project '${name}' saved with ${windows.length} window(s).`));
+      if (project.aliasName) {
+        console.log(chalk.green(`Alias '${project.aliasName}' opens this project.`));
+      }
+    } catch (err: any) {
+      console.error(chalk.red('Error capturing project:'), err.message);
+    }
+  });
+
+projectCommand
+  .command('create')
+  .argument('<name>', 'Project name')
+  .requiredOption('--template <template>', 'Template to use')
+  .requiredOption('--cwd <path>', 'Project working directory')
+  .option('--alias <alias>', 'Generated zsh alias name')
+  .option('--no-generate-alias', 'Do not create a generated zsh alias')
+  .description('Create a project from a reusable layout template')
+  .action((name, cmdOptions) => {
+    try {
+      validateLayoutName(name, 'Project name');
+      const store = readLayoutStore();
+      if (!store.templates[cmdOptions.template]) {
+        console.error(chalk.red(`Layout template '${cmdOptions.template}' not found.`));
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const aliasName = cmdOptions.alias || name;
+      const project: ProjectLayout = {
+        name,
+        cwd: path.resolve(cmdOptions.cwd),
+        aliasName: cmdOptions.generateAlias === false ? undefined : aliasName,
+        templateName: cmdOptions.template,
+        created: store.projects[name]?.created || now,
+        updated: now,
+      };
+
+      if (getOptions().dryRun) {
+        console.log(chalk.blue(`[Dry Run] Would create project '${name}' from template '${cmdOptions.template}'.`));
+        if (project.aliasName) console.log(chalk.blue(`[Dry Run] Would create alias '${project.aliasName}' = '${getProjectOpenCommand(name)}'.`));
+        return;
+      }
+
+      store.projects[name] = project;
+      writeLayoutStore(store);
+      if (project.aliasName) {
+        writeProjectAlias(name, project.aliasName);
+      }
+      console.log(chalk.green(`Project '${name}' created from template '${cmdOptions.template}'.`));
+      if (project.aliasName) {
+        console.log(chalk.green(`Alias '${project.aliasName}' opens this project.`));
+      }
+    } catch (err: any) {
+      console.error(chalk.red('Error creating project:'), err.message);
+    }
+  });
+
+projectCommand
+  .command('open')
+  .argument('<name>', 'Project name')
+  .description('Open project apps and restore their window positions')
+  .action((name) => {
+    try {
+      const store = readLayoutStore();
+      const project = store.projects[name];
+      if (!project) {
+        console.error(chalk.red(`Project '${name}' not found.`));
+        return;
+      }
+
+      const windows = resolveProjectWindows(project, store);
+      if (windows.length === 0) {
+        console.error(chalk.red(`Project '${name}' has no windows to open.`));
+        return;
+      }
+
+      if (getOptions().dryRun) {
+        console.log(chalk.blue(`[Dry Run] Would open ${uniqueAppNames(windows).length} app(s) for project '${name}' in ${project.cwd}.`));
+        printWindowSummary(windows);
+        return;
+      }
+
+      for (const appName of uniqueAppNames(windows)) {
+        openAppForProject(appName, project.cwd);
+      }
+      sleepSync(1200);
+      restoreWindows(windows);
+      console.log(chalk.green(`Opened project '${name}'.`));
+    } catch (err: any) {
+      console.error(chalk.red('Error opening project:'), err.message);
+    }
+  });
+
+projectCommand
+  .command('list')
+  .description('List project layouts')
+  .action(() => {
+    try {
+      const projects = Object.values(readLayoutStore().projects).sort((a, b) => a.name.localeCompare(b.name));
+      if (projects.length === 0) {
+        console.log(chalk.yellow('No projects found.'));
+        return;
+      }
+      console.log(chalk.bold('Projects:'));
+      for (const project of projects) {
+        const source = project.templateName ? `template: ${project.templateName}` : `${project.windows?.length || 0} window(s)`;
+        const aliasInfo = project.aliasName ? ` alias: ${project.aliasName}` : '';
+        console.log(`  ${chalk.cyan(project.name)} ${chalk.dim(`${source}${aliasInfo}`)} = ${project.cwd}`);
+      }
+    } catch (err: any) {
+      console.error(chalk.red('Error listing projects:'), err.message);
+    }
+  });
+
+projectCommand
+  .command('show')
+  .argument('<name>', 'Project name')
+  .description('Show a project layout')
+  .action((name) => {
+    try {
+      const store = readLayoutStore();
+      const project = store.projects[name];
+      if (!project) {
+        console.error(chalk.red(`Project '${name}' not found.`));
+        return;
+      }
+      const windows = resolveProjectWindows(project, store);
+      console.log(chalk.bold(`Project: ${project.name}`));
+      console.log(`  cwd: ${project.cwd}`);
+      if (project.aliasName) console.log(`  alias: ${project.aliasName}`);
+      if (project.templateName) console.log(`  template: ${project.templateName}`);
+      printWindowSummary(windows);
+    } catch (err: any) {
+      console.error(chalk.red('Error showing project:'), err.message);
+    }
+  });
+
+projectCommand
+  .command('remove')
+  .argument('<name>', 'Project name')
+  .description('Remove a project layout and its generated alias')
+  .action((name) => {
+    try {
+      const store = readLayoutStore();
+      const project = store.projects[name];
+      if (!project) {
+        console.error(chalk.red(`Project '${name}' not found.`));
+        return;
+      }
+
+      if (getOptions().dryRun) {
+        console.log(chalk.blue(`[Dry Run] Would remove project '${name}'.`));
+        if (project.aliasName) console.log(chalk.blue(`[Dry Run] Would remove generated alias '${project.aliasName}' if it still opens this project.`));
+        return;
+      }
+
+      removeProjectAlias(project);
+      delete store.projects[name];
+      writeLayoutStore(store);
+      console.log(chalk.green(`Project '${name}' removed.`));
+    } catch (err: any) {
+      console.error(chalk.red('Error removing project:'), err.message);
+    }
+  });
+
 // --- Sync commands ---
 
 const SYNC_ALIASES_FILE = 'aliases.json';
@@ -1356,6 +2007,7 @@ program
             message: 'What would you like to do?',
             choices: [
               { name: 'Add Alias', value: 'Add Alias' },
+              { name: 'Project Layouts', value: 'Project Layouts' },
               { name: 'Import from .zshrc', value: 'Import from .zshrc' },
               { name: 'Restore Backup', value: 'Restore Backup' },
               { name: 'Exit', value: 'Exit' }
@@ -1372,6 +2024,7 @@ program
               { name: 'Delete Alias', value: 'Delete Alias' },
               { name: 'Rename Alias', value: 'Rename Alias' },
               { name: 'List All', value: 'List All' },
+              { name: 'Project Layouts', value: 'Project Layouts' },
               { name: 'Toggle Sync', value: 'Toggle Sync' },
               { name: 'Import from .zshrc', value: 'Import from .zshrc' },
               { name: 'Backup/Restore', value: 'Backup/Restore' },
@@ -1422,6 +2075,104 @@ program
             const filePath = await input({ message: 'Path to backup file:' });
             if (filePath) {
               runRestore(filePath);
+            }
+          }
+        }
+        else if (action === 'Project Layouts') {
+          const store = readLayoutStore();
+          const subAction = await select({
+            message: 'Project Layouts',
+            choices: [
+              { name: 'Capture Template', value: 'capture-template' },
+              { name: 'Capture Project', value: 'capture-project' },
+              { name: 'Create Project from Template', value: 'create-project' },
+              { name: 'List Templates', value: 'list-templates' },
+              { name: 'List Projects', value: 'list-projects' },
+              { name: 'Back', value: 'back' }
+            ]
+          });
+
+          if (subAction === 'capture-template') {
+            const templateName = await input({ message: 'Template name:' });
+            if (!templateName) continue;
+            validateLayoutName(templateName, 'Template name');
+            const windows = await captureWindowSelection();
+            const now = new Date().toISOString();
+            store.templates[templateName] = {
+              name: templateName,
+              created: store.templates[templateName]?.created || now,
+              updated: now,
+              windows,
+            };
+            writeLayoutStore(store);
+            console.log(chalk.green(`Layout template '${templateName}' saved with ${windows.length} window(s).`));
+          } else if (subAction === 'capture-project') {
+            const projectName = await input({ message: 'Project name:' });
+            if (!projectName) continue;
+            validateLayoutName(projectName, 'Project name');
+            const cwdInput = await input({ message: 'Working directory:', default: process.cwd() });
+            const aliasName = await input({ message: 'Alias name:', default: projectName });
+            const windows = await captureWindowSelection();
+            const now = new Date().toISOString();
+            store.projects[projectName] = {
+              name: projectName,
+              cwd: path.resolve(cwdInput || process.cwd()),
+              aliasName: aliasName || projectName,
+              created: store.projects[projectName]?.created || now,
+              updated: now,
+              windows,
+            };
+            writeLayoutStore(store);
+            writeProjectAlias(projectName, aliasName || projectName);
+            console.log(chalk.green(`Project '${projectName}' saved with ${windows.length} window(s).`));
+          } else if (subAction === 'create-project') {
+            const templates = Object.values(store.templates).sort((a, b) => a.name.localeCompare(b.name));
+            if (templates.length === 0) {
+              console.log(chalk.yellow('No layout templates found.'));
+              continue;
+            }
+            const templateName = await select({
+              message: 'Template:',
+              choices: templates.map(t => ({ name: `${t.name} (${t.windows.length} window(s))`, value: t.name }))
+            });
+            const projectName = await input({ message: 'Project name:' });
+            if (!projectName) continue;
+            validateLayoutName(projectName, 'Project name');
+            const cwdInput = await input({ message: 'Working directory:', default: process.cwd() });
+            const aliasName = await input({ message: 'Alias name:', default: projectName });
+            const now = new Date().toISOString();
+            store.projects[projectName] = {
+              name: projectName,
+              cwd: path.resolve(cwdInput || process.cwd()),
+              aliasName: aliasName || projectName,
+              templateName,
+              created: store.projects[projectName]?.created || now,
+              updated: now,
+            };
+            writeLayoutStore(store);
+            writeProjectAlias(projectName, aliasName || projectName);
+            console.log(chalk.green(`Project '${projectName}' created from template '${templateName}'.`));
+          } else if (subAction === 'list-templates') {
+            const templates = Object.values(store.templates).sort((a, b) => a.name.localeCompare(b.name));
+            if (templates.length === 0) {
+              console.log(chalk.yellow('No layout templates found.'));
+            } else {
+              console.log(chalk.bold('Layout Templates:'));
+              for (const template of templates) {
+                console.log(`  ${chalk.cyan(template.name)} ${chalk.dim(`${template.windows.length} window(s)`)}`);
+              }
+            }
+          } else if (subAction === 'list-projects') {
+            const projects = Object.values(store.projects).sort((a, b) => a.name.localeCompare(b.name));
+            if (projects.length === 0) {
+              console.log(chalk.yellow('No projects found.'));
+            } else {
+              console.log(chalk.bold('Projects:'));
+              for (const project of projects) {
+                const source = project.templateName ? `template: ${project.templateName}` : `${project.windows?.length || 0} window(s)`;
+                const aliasInfo = project.aliasName ? ` alias: ${project.aliasName}` : '';
+                console.log(`  ${chalk.cyan(project.name)} ${chalk.dim(`${source}${aliasInfo}`)} = ${project.cwd}`);
+              }
             }
           }
         }
