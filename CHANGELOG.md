@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.1](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.5.0...v1.5.1) (2026-05-06)
+
+
+### Bug Fixes
+
+* keep layout tests platform-neutral ([b018be4](https://github.com/Lander-Parren/zsh-alias-manager/commit/b018be4f513497caf58491c60f158931b3c42a92))
+
 ## [1.5.0](https://github.com/Lander-Parren/zsh-alias-manager/compare/v1.4.0...v1.5.0) (2026-05-06)
 
 
